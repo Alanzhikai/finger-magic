@@ -1,0 +1,2654 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>指尖魔法 · Finger Magic —— 手势粒子交互</title>
+<!--
+  =====================================================================
+   指尖魔法 · Finger Magic —— Three.js + MediaPipe 手势粒子交互
+  ---------------------------------------------------------------------
+  CodePen 粘贴方式（本文件刻意不含 <html>/<body> 标签）：
+    <style>...</style> → CSS 面板 | <div id="stage">...</div> → HTML 面板
+    <script>...</script> → JS 面板（预处理器保持 None）
+  ---------------------------------------------------------------------
+  手势一览：
+    伸出 1 / 2 / 3 根手指   → 粒子瞬间炸出（清晰锐利的）立体数字 1 / 2 / 3（无倒计时）
+    五指张开                → "I ❤ U" 立体粒子文字 + 3D 气球与鲜花同步升起
+    显示图案时 旋转手掌     → 数字/告白/爱心 立体字形跟随手掌自由旋转（限幅防误跳）
+    I ❤ U 出现后 握拳       → 粒子 💗 炸出；💗 出现后 再握拳 → 炸散成"发光粒子球 + 球面照片"（同参考视频）
+    照片球内 手掌倾斜/转手腕 → 掌心轨迹球：整只手的姿态直接驱动整颗球 360° 全向旋转：
+                              手掌往左/右偏 = 左右旋转（绕 Y / yaw）；
+                              手掌往上/下偏 = 上下旋转（绕 X / pitch）；
+                              转动手腕(roll) = 环盘自转（绕 Z），转动/移动越快球越快；
+                              ★ 不需要摆任何特定手指姿势，自然张开手即可；保持倾斜
+                              就能一直转，四元数积分可累积过 360° 到任意朝向（正背面无死角）。
+                              ★ 手回正/停住 = 阻尼停稳（往前再转一点），照片比粒子慢一点点停；
+                              中立位自适应：以任意自然姿势起手都不会误转；
+                              👌 调取 / 握拳退出 / 收起手指时自动屏蔽旋转（少误触）。
+                              追踪点 = 掌根 4 点质心 + 手掌朝向 PCA：按真实识别帧去重、
+                              真实帧间隔计速、姿态/速度双 EMA 平滑、双死区滤抖 → 更精确。
+    照片球内 👌 轻捏        → 从球里调出正对你的那张照片，放大到屏幕中央（白边+橙色辉光）
+                              （拇指食指靠近即可、无需捏紧；仅照片球内识别，不干扰 1/2/3/I❤U/💗；
+                               0.75s 冷却防连触，握拳仍正常退出、不会误跳到别的界面）
+    👌 再来一次             → 放大的照片缩回球面；握拳(放大中) 也缩回；握拳(未放大) → 退出回待机
+    握拳（其它状态）        → 立即清空屏幕重置到待机
+  ★ 每次炸开都重新随机：粒子球面落点、每张照片的球面位置、炸散初速度都不同，
+    但最终都收敛成同一幅"发光粒子球 + 球面散布带白边照片"的画面（过程随机、终态一致）。
+    V 键                    → 显示/隐藏左下角「手势追踪」摄像头小窗（默认常驻显示），
+                              实时叠加 21 点骨架 + 手掌中心轨迹/中立位/偏转箭头 + 识别结果/置信度
+  ★ 手势识别（CONFIG.GEST）：三证据融合（关节弯折比 / 沿掌伸展投影 / 指尖离腕距离）
+    + 迟滞 + 分类置信度门控 —— 手掌倾斜也能认准 1/2/3/I❤U/💗，半屈、松手过渡一律
+    判为"不清晰"不触发；按真实 MediaPipe 帧计数（不再被 60fps 主循环重复计数），
+    清晰动作稳定约 0.2 秒才提交，提交后锁定 0.62 秒 + 边沿触发，不会来回跳；
+    图案旋转灵敏度见 CONFIG.SHAPE_ROT_GAIN；照片球掌心轨迹球(PHYS.TILT_GAIN /
+    ROLL_GAIN / SPEED_GAIN / MAX_W)、姿态与速度平滑(PHYS.POSE_SMOOTH / VEL_SMOOTH /
+    DEAD_TILT / DEAD_VEL)、惯性与离心力见 CONFIG.PHYS。
+  ---------------------------------------------------------------------
+  ★ 换成自己的照片：把图片地址填进 CONFIG.PHOTOS 数组即可（支持 http(s)
+    链接、相对路径、base64）。也可以点右上角 + 一次多选多张、把图片文件
+    拖进页面、或 Ctrl+V 粘贴图片，都会全部加入照片球（可连续多次添加累加）。
+  ★ 一旦添加了自己的照片，球面就只显示这些照片，占位预览图(PHOTO 1~12)自动移除。
+  ★ 球面照片大小随机不一（CONFIG.PHOTO_SIZE_MIN/MAX 限幅，不过大不过小），
+    系数在照片创建时固定，每次炸开只换位置、构图终态一致。
+  =====================================================================
+-->
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+  #stage { position: fixed; inset: 0; background: #000; }
+  #gl { display: block; width: 100%; height: 100%; }
+
+  /* 右上角半透明全屏按钮 —— 界面上唯一保留的控件 */
+  #fsBtn {
+    position: fixed; top: 18px; right: 18px; z-index: 20;
+    width: 44px; height: 44px; border-radius: 13px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    color: rgba(255, 255, 255, .82);
+    background: rgba(255, 255, 255, .07);
+    border: 1px solid rgba(255, 255, 255, .16);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    transition: background .25s, color .25s, transform .25s;
+  }
+  #fsBtn:hover { background: rgba(255, 255, 255, .17); color: #fff; transform: scale(1.06); }
+  #fsBtn svg { width: 20px; height: 20px; }
+
+  /* 文件选择器：用离屏定位隐藏（不能用 display:none / hidden，否则 iOS Safari 等移动端
+     WebView 调 .click() 不会唤起相册）。保留一个可被 .click() 的真实元素即可。 */
+  #fileInput {
+    position: fixed; top: -9999px; left: -9999px;
+    width: 1px; height: 1px; opacity: 0; pointer-events: none;
+  }
+
+  /* 添加照片按钮：与全屏按钮同款样式，位于其下方 */
+  #addBtn {
+    position: fixed; top: 70px; right: 18px; z-index: 20;
+    width: 44px; height: 44px; border-radius: 13px; cursor: pointer;
+    display: flex; align-items: center; justify-content: center;
+    color: rgba(255, 255, 255, .82);
+    background: rgba(255, 255, 255, .07);
+    border: 1px solid rgba(255, 255, 255, .16);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    transition: background .25s, color .25s, transform .25s;
+  }
+  #addBtn:hover { background: rgba(255, 255, 255, .17); color: #fff; transform: scale(1.06); }
+  #addBtn svg { width: 20px; height: 20px; }
+
+  /* 启动提示（自动淡出，非调试信息） */
+  #hint {
+    position: fixed; left: 0; right: 0; bottom: 46px; z-index: 15;
+    text-align: center; pointer-events: none;
+    color: rgba(255, 255, 255, .42); letter-spacing: .08em;
+    font: 13px/1.8 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    transition: opacity .8s ease;
+  }
+  #hint.hide { opacity: 0; }
+
+  /* 摄像头「手势追踪」小窗：默认常驻左下角，V 键可隐藏。
+     仍不创建任何 <video> 元素 —— 宿主会把 <video> 套全屏浮层盖住粒子，
+     故继续用 ImageCapture 抓帧 + canvas 回显；并在同一 canvas 内做镜像绘制，
+     叠加 MediaPipe 21 点骨架/连线，实时显示"自己的动作"与识别结果、置信度。 */
+  #camWrap {
+    position: fixed; bottom: 18px; left: 18px; z-index: 25; width: 236px;
+    border-radius: 14px; overflow: hidden; user-select: none;
+    background: rgba(14, 14, 20, .72);
+    border: 1px solid rgba(255, 255, 255, .16);
+    box-shadow: 0 10px 36px rgba(0, 0, 0, .55);
+    backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+    transition: opacity .3s, transform .3s;
+  }
+  #camWrap.hidden { opacity: 0; transform: translateY(14px) scale(.96); pointer-events: none; }
+  #cam { display: block; width: 100%; height: 177px; background: #0a0a10; }
+  .cam-top {
+    position: absolute; top: 0; left: 0; right: 0; height: 27px;
+    display: flex; align-items: center; gap: 6px; padding: 0 9px;
+    font: 11px/1 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    letter-spacing: .06em; color: rgba(255, 255, 255, .92);
+    background: linear-gradient(rgba(0, 0, 0, .68), rgba(0, 0, 0, 0));
+  }
+  .cam-dot {
+    width: 6px; height: 6px; border-radius: 50%; background: #4ade80;
+    box-shadow: 0 0 7px #4ade80; animation: camPulse 1.6s ease-in-out infinite;
+  }
+  @keyframes camPulse { 50% { opacity: .32; } }
+  .cam-top .cam-tag { margin-left: auto; color: rgba(255, 255, 255, .55); font-size: 10px; }
+  .cam-bot {
+    position: absolute; left: 0; right: 0; bottom: 0; padding: 15px 9px 8px;
+    background: linear-gradient(rgba(0, 0, 0, 0), rgba(0, 0, 0, .82));
+    font: 12px/1.3 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; color: #fff;
+  }
+  .cam-res { display: flex; align-items: baseline; gap: 7px; }
+  .cam-res b { font-size: 13px; font-weight: 600; letter-spacing: .02em; }
+  .cam-res span { color: rgba(255, 255, 255, .6); font-size: 11px; }
+  .cam-conf { margin-top: 6px; height: 4px; border-radius: 3px; background: rgba(255, 255, 255, .16); overflow: hidden; }
+  .cam-conf i { display: block; height: 100%; width: 0; border-radius: 3px;
+    background: linear-gradient(90deg, #ff8fb1, #ffd27a); transition: width .12s linear; }
+
+  /* 启动遮罩：必须点击后才请求摄像头，满足浏览器"用户手势"要求（直接自动调用会被拒绝） */
+  #start {
+    position: fixed; inset: 0; z-index: 60;
+    display: flex; align-items: center; justify-content: center;
+    background: rgba(0, 0, 0, .94); backdrop-filter: blur(6px);
+    transition: opacity .6s ease; text-align: center;
+  }
+  #start.hide { opacity: 0; pointer-events: none; }
+  #start .logo {
+    color: #fff; font: 600 44px/1.1 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+    letter-spacing: .14em;
+  }
+  #start .sub {
+    margin-top: 16px; color: rgba(255, 255, 255, .5);
+    font: 14px/1.6 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; letter-spacing: .06em;
+  }
+  #start .cta {
+    margin-top: 34px; padding: 14px 36px; border-radius: 44px; cursor: pointer;
+    color: #fff; background: rgba(255, 255, 255, .09);
+    border: 1px solid rgba(255, 255, 255, .28);
+    font: 15px/1 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif; letter-spacing: .12em;
+    transition: background .25s, transform .25s;
+  }
+  #start .cta:hover:not(:disabled) { background: rgba(255, 255, 255, .2); transform: scale(1.04); }
+  #start .cta:disabled { opacity: .6; cursor: default; }
+  #start .cta2 { margin-top: 14px; background: rgba(255, 255, 255, .14); border-color: rgba(255, 255, 255, .34); }
+  #start .alt {
+    display: block; margin-top: 22px; color: rgba(255, 255, 255, .42); font-size: 13px;
+    text-decoration: none; letter-spacing: .04em;
+  }
+  #start .alt:hover { color: rgba(255, 255, 255, .85); }
+  #start .tip {
+    margin-top: 18px; min-height: 18px; color: #ff7a7a; font-size: 12.5px;
+    line-height: 1.5; padding: 0 24px; letter-spacing: .02em;
+  }
+
+  /* 动作指引面板（左上角）：动态显示当前/下一步动作、目标图案，并有手掌重复演示目标动作 */
+  #guide {
+    position: fixed; top: 16px; left: 16px; z-index: 25; width: 250px;
+    padding: 14px 14px 12px; border-radius: 16px; color: #fff;
+    background: rgba(18, 18, 26, .5); border: 1px solid rgba(255, 255, 255, .12);
+    backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px);
+    box-shadow: 0 12px 44px rgba(0, 0, 0, .45); user-select: none;
+    font: 13px/1.5 -apple-system, "PingFang SC", "Microsoft YaHei", sans-serif;
+  }
+  #guide .g-head {
+    font-size: 12px; letter-spacing: .14em; color: rgba(255, 255, 255, .58);
+    margin-bottom: 11px; display: flex; align-items: center; gap: 6px;
+  }
+  #guide .g-cur { display: flex; align-items: center; gap: 11px; }
+  #guide .g-hand { width: 60px; height: 82px; flex: 0 0 auto; position: relative; }
+  #guide .g-hand svg { width: 100%; height: 100%; overflow: visible;
+    filter: drop-shadow(0 1px 2px rgba(0, 0, 0, .4)) drop-shadow(0 0 6px rgba(255, 180, 210, .35)); }
+  #guide .g-hand .finger { stroke: rgba(176, 116, 86, .45); stroke-width: .7; stroke-linejoin: round; }
+  #guide .g-hand .palm  { stroke: rgba(176, 116, 86, .35); stroke-width: .7; stroke-linejoin: round; }
+  /* I❤U / 💗 阶段：手旁浮现脉动的爱心，强化语义 */
+  #guide .g-hand.beat::after {
+    content: '💗'; position: absolute; right: -16px; top: -6px; font-size: 21px;
+    animation: guideBeat 1.05s ease-in-out infinite; pointer-events: none;
+  }
+  @keyframes guideBeat {
+    0%, 100% { transform: scale(.82) translateY(0); opacity: .65; }
+    50%      { transform: scale(1.18) translateY(-2px); opacity: 1; }
+  }
+  #guide .g-info { flex: 1; min-width: 0; }
+  #guide .g-label { font-size: 14px; font-weight: 600; }
+  #guide .g-target { margin-top: 5px; font-size: 12px; color: rgba(255, 255, 255, .72);
+    display: flex; align-items: center; }
+  #guide .g-chip {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 30px; padding: 2px 9px; margin-left: 7px; border-radius: 9px;
+    background: rgba(255, 255, 255, .14); border: 1px solid rgba(255, 255, 255, .2);
+    font-size: 13px; font-weight: 700; letter-spacing: .02em;
+  }
+  #guide .g-next {
+    margin-top: 11px; padding-top: 11px; border-top: 1px solid rgba(255, 255, 255, .1);
+    font-size: 12.5px; color: rgba(255, 255, 255, .78); display: flex; align-items: center; flex-wrap: wrap;
+  }
+  #guide .g-next .g-chip { background: rgba(255, 255, 255, .07); margin-left: 7px; }
+  #guide .g-steps { margin-top: 12px; display: flex; gap: 4px; }
+  #guide .g-step {
+    flex: 1; text-align: center; font-size: 10px; line-height: 1.3; padding: 5px 1px;
+    border-radius: 8px; background: rgba(255, 255, 255, .06); color: rgba(255, 255, 255, .55);
+    border: 1px solid transparent; transition: background .3s, color .3s, border-color .3s;
+  }
+  #guide .g-step .n { display: block; font-size: 12px; font-weight: 700; margin-bottom: 1px; }
+  #guide .g-step.active {
+    background: rgba(255, 120, 160, .22); color: #fff; border-color: rgba(255, 120, 160, .55);
+  }
+  #guide .g-step.done { color: rgba(255, 255, 255, .85); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <div id="camWrap">
+    <canvas id="cam"></canvas>
+    <div class="cam-top"><span class="cam-dot"></span>手势追踪<span class="cam-tag">V 显隐</span></div>
+    <div class="cam-bot">
+      <div class="cam-res"><b id="camRes">等待手势…</b><span id="camTip">把手放进画面</span></div>
+      <div class="cam-conf"><i id="camConf"></i></div>
+    </div>
+  </div>
+  <div id="hint"></div>
+  <div id="guide">
+    <div class="g-head">👋 动作指引</div>
+    <div class="g-cur">
+      <div class="g-hand" id="gHand"></div>
+      <div class="g-info">
+        <div class="g-label">当前：<span id="gCurLabel">张开五指</span></div>
+        <div class="g-target">目标<span class="g-chip" id="gCurTarget">I ❤ U</span></div>
+      </div>
+    </div>
+    <div class="g-next">下一步：<span id="gNextLabel">握拳</span><span class="g-chip" id="gNextTarget">💗</span></div>
+    <div class="g-steps" id="gSteps">
+      <div class="g-step" data-i="0"><span class="n">1</span>1</div>
+      <div class="g-step" data-i="1"><span class="n">2</span>2</div>
+      <div class="g-step" data-i="2"><span class="n">3</span>3</div>
+      <div class="g-step" data-i="3"><span class="n">4</span>I❤U</div>
+      <div class="g-step" data-i="4"><span class="n">5</span>💗</div>
+      <div class="g-step" data-i="5"><span class="n">6</span>照片</div>
+    </div>
+  </div>
+  <button id="fsBtn" title="全屏">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round">
+      <path d="M8 3H5a2 2 0 0 0-2 2v3M16 3h3a2 2 0 0 1 2 2v3M8 21H5a2 2 0 0 1-2-2v-3M16 21h3a2 2 0 0 0 2-2v-3"/>
+    </svg>
+  </button>
+  <button id="addBtn" title="添加照片">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"
+         stroke-linecap="round" stroke-linejoin="round">
+      <path d="M12 5v14M5 12h14"/>
+    </svg>
+  </button>
+  <input id="fileInput" type="file" accept="image/*" multiple>
+  <div id="start">
+    <div class="card">
+      <div class="logo">指尖魔法</div>
+      <div class="sub">伸出手指 · 五指告白 · 握拳炸出爱心 · 再握拳 → 发光照片球</div>
+      <button id="camStart" class="cta">开启摄像头</button>
+      <button id="addStart" class="cta cta2">从相册添加照片</button>
+      <a id="demoStart" class="alt" href="#">没有摄像头？用键盘演示 →</a>
+      <div id="startTip" class="tip"></div>
+    </div>
+  </div>
+</div>
+<script>
+(async () => {
+  /* ==================================================================
+   * 0. 配置
+   * ================================================================== */
+  const CONFIG = {
+    // ★ 自己的照片填这里（留空则自动生成占位照片，可随时拖图/粘贴添加）
+    PHOTOS: [],
+    THREE_URL: 'https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js',
+    MP_URL:    'https://cdn.jsdelivr.net/npm/@mediapipe/hands@0.4.1675469240/',
+    MAX_PARTICLES: 24000,
+    PHOTO_W: 2.35,         // 单张照片宽
+    PHOTO_H: 1.62,         // 单张照片高
+    SPHERE_R: 5.0,         // 发光粒子球 / 照片球半径
+    SPHERE_SPIN: 0.055,    // 照片球自动自转速度 (rad/s)：调慢，避免整体一直在转
+    PHOTO_BASE_SCALE: 0.60,// 球面小照片尺寸（相对原图）
+    // 每张照片在基础尺寸上乘一个固定随机系数 → 大小不一；限幅在 [MIN,MAX]
+    // （约 -20% ~ +24%），不会太大也不会太小。系数在照片创建时确定，
+    // 不随每次炸开变化 → 位置每次随机、构图终态仍一致。
+    PHOTO_SIZE_MIN: 0.80,
+    PHOTO_SIZE_MAX: 1.24,
+    PHOTO_ZOOM_SCALE: 1.55,// 用 👌 轻捏调取到屏幕中央时的放大倍率（统一放大，不随随机尺寸变）
+    ROT_DIR: 1,            // 旋转方向；若方向相反改成 -1
+    SHAPE_ROT_GAIN: 1.35,  // 手掌旋转 → 数字/告白/爱心 旋转的灵敏度（越小越稳、不易误跳）
+
+    // ★ 照片球物理（掌心轨迹球：手掌姿态驱动全向 360° 旋转 + 惯性 + 离心力）
+    //   不需要摆任何特定手指姿势，手自然张开即可控制：
+    //     ① 手掌中心相对"中立位"的偏转 → 持续角速度：往左/右偏 → 绕 Y(yaw)，
+    //        往上/下偏 → 绕 X(pitch)；偏转越大转得越快，保持倾斜就能一直转、
+    //        四元数积分可累积过 360° 到任意朝向（正背面无死角）。
+    //     ② 手腕转动(roll)的角度 → 绕 Z 环盘自转；手腕转动角速度与手掌移动
+    //        速度额外叠加"甩动加速" → 严格手快球快 / 手慢球慢。
+    //     ③ 手回正 / 停住 → 死区判定后不驱动，走阻尼衰减，继续"往前"转一点再停。
+    //   ★ 中立位自适应：静止回正时缓慢校准到当前姿态，因此以任意自然姿势起手
+    //     都不会误转；主动偏转时基准保持不动 → 持续转。
+    //   ★ 少误触：👌 调取 / 握拳退出 / 手指全收起时屏蔽旋转；只在真实 MediaPipe
+    //     帧(ver 去重)上计速、真实帧间隔 dt、姿态与速度双 EMA、双死区滤抖，
+    //     MAX_W 硬上限保证不会太快。追踪窗高亮手掌中心 + 中立位 + 偏转箭头。
+    //   惯性/慢停/回齐：角速度平滑逼近目标；照片球响应与衰减略慢 → 比粒子慢一点点停，
+    //     角差 clamp 防脱节；停稳后缓慢回齐消除固定错位（历史行为不变）。
+    //   离心力：F_c = m·ω²·r，a_c = ω²·r。膨胀量 ∝ ω²·SPHERE_R(球半径)，每个粒子带各自
+    //     centriK 系数 → 间距增大幅度各不相同；CENTRI_MAX 限幅；静止归零 → 终态构图一致。
+    PHYS: {
+      // ★ 掌心轨迹球："姿态偏转 → 持续角速度" + "转动/移动速度 → 加速"
+      POSE_SMOOTH:     0.45, // 手掌中心 / 朝向 EMA（越小越稳、越不抖）
+      TILT_GAIN:       3.20, // 手掌中心偏转(归一化) → 持续角速度 (rad/s)
+      TILT_MAX:        0.26, // 中心偏转限幅：手移出画面也不会无限快
+      ROLL_GAIN:       1.05, // 手腕转动角度(rad) → 绕 Z 环盘角速度
+      ROLL_MAX:        1.20, // 手腕偏转限幅 (rad)
+      ROLL_WEIGHT:     0.28, // roll 偏转折算进"回正判定"的量纲权重
+      SPEED_GAIN:      0.85, // 手掌移动速度 → 额外角速度（甩动加速，手快球快）
+      ROLL_SPEED_GAIN: 0.45, // 手腕转动角速度 → 额外角速度
+      VEL_SMOOTH:      0.40, // 速度 EMA：滤单帧抖动
+      DEAD_TILT:       0.030,// 偏转死区：小于它视为回正 → 不驱动、走阻尼停稳
+      DEAD_VEL:        0.10, // 速度死区（归一化/秒 或 rad/s）：手停/微抖视为静止
+      NEUTRAL_ALPHA:   0.020,// 中立位自适应重标定速度（仅静止回正时生效）
+      DT_MIN:          0.008,// 帧间隔下限 (s)：防除零/异常尖峰
+      DT_MAX:          0.080,// 帧间隔上限 (s)：防切后台回来时的速度突变
+      ROT_SMOOTH:      0.40, // 图案阶段手掌 roll 二次 EMA（数字/爱心单轴跟手旋转，历史不变）
+      TRAIL_LEN:       16,   // 追踪窗手掌中心拖尾点数
+      STALE_MS:        220,  // 无新真实识别帧超过此值 → 视为手停，走阻尼衰减
+      MAX_W:           2.60, // 角速度硬上限 (rad/s)：再快的手也不超过 → "不要太快"
+      // 惯性 / 慢停
+      DRIVE_RESP:    8.0,  // 角速度逼近"指尖速度对应目标角速度"的响应 (1/s)，越大越跟手
+      PHOTO_RESP:    0.80, // 照片球响应系数(略小于1) → 比粒子球慢一点点
+      FLING_GAIN:    1.8,  // 键盘方向键(演示)的角速度冲量增益
+      FLING_DAMP:    2.2,  // 甩动冲量衰减 (1/s)
+      DAMP_PART:     1.20, // 手停/离开后粒子球角速度衰减 (1/s)，越小惯性越久
+      DAMP_PHOTO:    0.98, // 照片球衰减略小 → 比粒子慢一点点停下
+      PHOTO_LAG_MAX: 0.16, // 照片朝向相对粒子朝向的最大角差 (rad) clamp，避免脱节不真实
+      CENTRI_K:      0.0055,// 膨胀 = CENTRI_K·ω²·SPHERE_R
+      CENTRI_MAX:    0.10, // 全局膨胀比例上限 (≈10%)：粒子间距不会过大、不失真
+      CENTRI_SPEED:  5.5   // 膨胀量平滑跟随速度 (1/s)：离心力建立/消退有过程更真实
+    },
+    SHAPE_DEPTH: 1.8,      // 数字/爱心 立体厚度（世界单位）；告白文字自动略薄
+    SHAPE_DEPTH_LOVE: 1.4, // "I ❤ U" 立体厚度（文字较长，略薄更协调）
+
+    // ★ 手势识别：三证据融合 + 迟滞 + 置信度门控（替代原来的"单一比值硬卡 0.80"）。
+    //   旧判定 d(根,尖)/(根→中节+中节→尖) 在手掌倾斜/侧对镜头时投影缩短，
+    //   明明伸直也掉到 0.80 以下 → 目标动作识别不出；而贴着单阈值的 up 又会在
+    //   1/2/3 之间逐帧横跳，凑够稳定帧就误提交 → 容易误触。现在：
+    //     ① 每根手指融合 3 个互补证据（关节弯折比 / 沿掌方向伸展 / 指尖离腕距离），
+    //        手掌不正对镜头也能判准；
+    //     ② 迟滞 ON/OFF 双阈值，阈值附近保持上一帧状态，杜绝横跳；
+    //     ③ 分类边际 margin = 各指离"翻转阈值"的最小距离，太小 = 半屈/过渡态，
+    //        直接输出 none（不累积、不触发），从源头掐掉误触；
+    //     ④ 稳定帧按真实 MediaPipe 帧计数（主循环 60fps 不再重复计数同一帧数据）。
+    GEST: {
+      STRAIGHT_W:    [0.42, 0.34, 0.24], // 三证据权重：弯折比 / 沿掌伸展 / 离腕距离
+      RATIO_RANGE:   [0.55, 0.93],       // 弯折比归一化区间（收起≈0.5，伸直≈0.95+）
+      ALONG_RANGE:   [0.30, 1.10],       // 沿掌伸展 / 掌长 归一化区间
+      REACH_RANGE:   [1.20, 2.10],       // 腕到指尖 / 掌长 归一化区间
+      FINGER_ON:     0.56,               // 得分 ≥ 此值判"伸直"
+      FINGER_OFF:    0.40,               // 得分 ≤ 此值判"收起"；两者之间保持上一帧（迟滞带）
+      MIN_MARGIN:    0.13,               // 分类边际下限：低于它 = 动作不清晰 → none
+      CONF_FULL:     0.36,               // margin 达到此值置信度记满（用于小窗显示与提交门控）
+      SWITCH_CONF:   0.42,               // 提交/切换手势所需的最低置信度（≈ margin 0.15）
+      STABLE_FRAMES: 6,     // 清晰动作需连续保持的真实帧数（≈0.2s @30fps）才提交
+      COMMIT_LOCK:   0.62,  // 提交后锁定秒数：锁定期内忽略新手势，杜绝来回跳变
+      SMOOTH_ALPHA:  0.45,  // 关键点平滑系数（越小越稳、跟手越慢）
+
+      // ★ 照片球内「👌 轻捏调取照片」专用：放宽触发，但靠「仅照片球内生效 + 伸直度护栏
+      //   + 稳定帧 + 冷却锁 + 退出加严」保证不误触、不跳到其它界面。
+      PINCH_DIST:        0.44,  // 拇指尖-食指尖 / 掌宽（轻捏即可，无需捏紧）
+      PINCH_MIN_STRAIGHT: 0.38, // 四指平均伸直得分下限：排除「真握拳」(四指全折回≈0.2)，
+                                //   握拳仍能被识别为退出；微弯的 👌(≈0.6) 顺利放行
+      PINCH_MAX_UP:       3,    // 伸直指数上限：排除五指全张(4)，张手只转球、不调取
+      PINCH_STABLE:       4,    // 捏合专用稳定帧
+      PINCH_COOLDOWN:     0.75, // 调取后冷却秒数：一次捏合只放大/缩回一次，杜绝连触抖动
+      FIST_EXIT_STABLE:   12    // 照片球内握拳退出需更久确认，防止捏合/松手过渡被误读成
+                                //   握拳而意外退出跳回待机
+    }
+  };
+
+  const hintEl = document.getElementById('hint');
+  const setHint = (txt, autoHide = 0) => {
+    hintEl.textContent = txt;
+    hintEl.classList.remove('hide');
+    if (autoHide) setTimeout(() => hintEl.classList.add('hide'), autoHide);
+  };
+
+  /* ==================================================================
+   * 1. 依赖：Three.js（ESM 动态导入）+ MediaPipe Hands（脚本注入）
+   * ================================================================== */
+  const dynamicImport = new Function('u', 'return import(u)'); // 规避预处理器改写
+  const THREE = await dynamicImport(CONFIG.THREE_URL);
+
+  const loadScript = (src) => new Promise((res, rej) => {
+    const s = document.createElement('script');
+    s.src = src; s.crossOrigin = 'anonymous';
+    s.onload = res; s.onerror = () => rej(new Error('加载失败: ' + src));
+    document.head.appendChild(s);
+  });
+
+  /* ==================================================================
+   * 2. Three.js 场景
+   * ================================================================== */
+  const canvas = document.getElementById('gl');
+  const renderer = new THREE.WebGLRenderer({ canvas, antialias: true, alpha: false });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setSize(innerWidth, innerHeight, false);
+  renderer.setClearColor(0x000000, 1);
+
+  const scene = new THREE.Scene();
+  const CAM_Z = 14;
+  const camera = new THREE.PerspectiveCamera(55, innerWidth / innerHeight, 0.1, 200);
+  camera.position.set(0, 0, CAM_Z);
+  camera.lookAt(0, 0, 0);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x223344, 1.5));
+  const keyLight = new THREE.DirectionalLight(0xffffff, 2.2);
+  keyLight.position.set(4, 8, 10); scene.add(keyLight);
+  const rimLight = new THREE.PointLight(0xff87b6, 1.4, 60);
+  rimLight.position.set(-6, -3, 8); scene.add(rimLight);
+
+  // 当前视口下 z=0 平面的可见尺寸（用于文字自适应，保证显示完整）
+  const viewport = () => {
+    const h = 2 * Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) * CAM_Z;
+    return { h, w: h * camera.aspect };
+  };
+
+  addEventListener('resize', () => {
+    camera.aspect = innerWidth / innerHeight;
+    camera.updateProjectionMatrix();
+    renderer.setSize(innerWidth, innerHeight, false);
+    refreshShape(); // 重新排版当前粒子文字
+  });
+
+  /* ==================================================================
+   * 3. 粒子系统（文字 / 心形 / 星尘 共用一套 Points）
+   * ================================================================== */
+  const dotTexture = (() => {
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const g = c.getContext('2d');
+    // ★ 实心圆点：纯白实心核心 + 仅 1px 抗锯齿软边。配合 alphaTest 得到干净实心圆，
+    //   不再有柔软光晕（那正是之前"空心/能看穿"的视觉来源之一）。
+    const grd = g.createRadialGradient(32, 32, 0, 32, 32, 31);
+    grd.addColorStop(0.0, 'rgba(255,255,255,1)');
+    grd.addColorStop(0.82, 'rgba(255,255,255,1)');
+    grd.addColorStop(0.94, 'rgba(255,255,255,0.85)');
+    grd.addColorStop(1.0, 'rgba(255,255,255,0)');
+    g.fillStyle = grd; g.fillRect(0, 0, 64, 64);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  })();
+
+  class ParticleField {
+    constructor(max) {
+      this.max = max; this.active = 0;
+      this.jitter = false;   // 仅待机星尘允许轻微呼吸；成型手势图案必须稳如磐石
+      this.pos = new Float32Array(max * 3);
+      this.col = new Float32Array(max * 3);
+      this.tgt = new Float32Array(max * 3);
+      this.tcol = new Float32Array(max * 3);
+      this.vel = new Float32Array(max * 3);
+      this.ph = new Float32Array(max);
+      for (let i = 0; i < max; i++) this.ph[i] = Math.random() * Math.PI * 2;
+      // 每个粒子独立的离心膨胀系数（0.5~1.3）：同一转速下"间距增大幅度各不相同"。
+      this.centriK = new Float32Array(max);
+      for (let i = 0; i < max; i++) this.centriK[i] = 0.5 + Math.random() * 0.8;
+      this.expand = 0;   // 当前全局离心膨胀比例（由 tick 按 ω²·R 计算并平滑）
+
+      const geo = new THREE.BufferGeometry();
+      geo.setAttribute('position', new THREE.BufferAttribute(this.pos, 3));
+      geo.setAttribute('color', new THREE.BufferAttribute(this.col, 3));
+      geo.setDrawRange(0, 0);
+      this.geo = geo;
+
+      this.mat = new THREE.PointsMaterial({
+        // ★ 实体实心：不透明 + 深度遮挡（写深度 + alphaTest 实心圆），正面粒子遮挡背面，
+        //   不再能看穿。配合 buildShapeTargets 的体积填充，数字/字母/爱心读成密实 3D 实心块。
+        size: 0.18, map: dotTexture, vertexColors: true, transparent: false,
+        alphaTest: 0.5, depthWrite: true, depthTest: true,
+        blending: THREE.NormalBlending, sizeAttenuation: true
+      });
+      this.points = new THREE.Points(geo, this.mat);
+      this.points.frustumCulled = false;
+      scene.add(this.points);
+    }
+
+    /** list: [{x,y,z,r,g,b}]；explode: true 时粒子先向外炸开再聚合 */
+    setTargets(list, { explode = false, burst = 12, scatter = 0.35 } = {}) {
+      const n = Math.min(list.length, this.max);
+      const idx = [...list.keys()];
+      for (let i = idx.length - 1; i > 0; i--) {          // 洗牌，避免采样扫描线感
+        const j = (Math.random() * (i + 1)) | 0;
+        [idx[i], idx[j]] = [idx[j], idx[i]];
+      }
+      for (let i = 0; i < n; i++) {
+        const p = list[idx[i]], i3 = i * 3;
+        this.tgt[i3] = p.x; this.tgt[i3 + 1] = p.y; this.tgt[i3 + 2] = p.z;
+        this.tcol[i3] = p.r; this.tcol[i3 + 1] = p.g; this.tcol[i3 + 2] = p.b;
+        // 新出现的粒子（或整场爆开时）从中心随机位置诞生 —— 视觉上就是"瞬间炸出"
+        if (explode || i >= this.active) {
+          this.pos[i3]     = (Math.random() - 0.5) * scatter;
+          this.pos[i3 + 1] = (Math.random() - 0.5) * scatter;
+          this.pos[i3 + 2] = (Math.random() - 0.5) * scatter;
+          this.col[i3] = p.r; this.col[i3 + 1] = p.g; this.col[i3 + 2] = p.b;
+        }
+        if (explode) {
+          const dx = this.pos[i3] - 0, dy = this.pos[i3 + 1] - 0, dz = this.pos[i3 + 2];
+          const len = Math.hypot(dx, dy, dz) || 1;
+          const s = burst * (0.45 + Math.random() * 0.55);
+          this.vel[i3] = dx / len * s + (Math.random() - 0.5) * 3;
+          this.vel[i3 + 1] = dy / len * s + (Math.random() - 0.5) * 3;
+          this.vel[i3 + 2] = dz / len * s * 0.5 + (Math.random() - 0.5) * 2;
+        }
+      }
+      this.active = n;
+      this.geo.setDrawRange(0, n);
+      this.geo.attributes.position.needsUpdate = true;
+      this.geo.attributes.color.needsUpdate = true;
+    }
+
+    update(dt, t) {
+      const stiff = 40, damp = 11;   // 临界阻尼附近：平滑收敛、几乎无回弹
+      const kd = Math.min(1, damp * dt), kc = Math.min(1, 5.5 * dt);
+      const jitter = this.jitter;    // 成型图案关闭抖动；仅待机星尘保留呼吸
+      const expand = this.expand;    // 离心膨胀比例（照片球旋转时 >0，其余恒为 0）
+      for (let i = 0; i < this.active; i++) {
+        const i3 = i * 3;
+        // 离心力：球面目标沿径向放大 (1 + expand·k_i)；Δr_i ∝ ω²·R·r_i，与 a_c = ω²·r 一致，
+        // k_i 每粒子不同 → 间距增大幅度各不相同；expand=0 时目标即原球面（终态一致）。
+        const e = 1 + expand * this.centriK[i];
+        const gx = this.tgt[i3] * e, gy = this.tgt[i3 + 1] * e, gz = this.tgt[i3 + 2] * e;
+        this.vel[i3]     += (gx - this.pos[i3])     * stiff * dt;
+        this.vel[i3 + 1] += (gy - this.pos[i3 + 1]) * stiff * dt;
+        this.vel[i3 + 2] += (gz - this.pos[i3 + 2]) * stiff * dt;
+        for (let k = 0; k < 3; k++) {
+          const j = i3 + k;
+          this.vel[j] -= this.vel[j] * kd;
+          this.pos[j] += this.vel[j] * dt;
+          this.col[j] += (this.tcol[j] - this.col[j]) * kc;
+        }
+        if (jitter) {
+          // 待机星尘：轻微呼吸，赋予"生命感"，不呆板
+          this.vel[i3]     += Math.sin(t * 1.9 + this.ph[i]) * 0.6 * dt;
+          this.vel[i3 + 1] += Math.cos(t * 1.5 + this.ph[i] * 1.3) * 0.6 * dt;
+        } else {
+          // 锁定：粒子足够接近目标且速度极小时直接吸附并清零速度，
+          // 彻底消除残余抖动手感——手势成型后图案稳如磐石（与参考视频一致）
+          const dx = gx - this.pos[i3], dy = gy - this.pos[i3 + 1], dz = gz - this.pos[i3 + 2];
+          const d2 = dx * dx + dy * dy + dz * dz;
+          const v2 = this.vel[i3] * this.vel[i3] + this.vel[i3 + 1] * this.vel[i3 + 1] + this.vel[i3 + 2] * this.vel[i3 + 2];
+          if (d2 < 0.0009 && v2 < 0.0009) {
+            this.pos[i3] = gx; this.pos[i3 + 1] = gy; this.pos[i3 + 2] = gz;
+            this.vel[i3] = this.vel[i3 + 1] = this.vel[i3 + 2] = 0;
+          }
+        }
+      }
+      this.geo.attributes.position.needsUpdate = true;
+      this.geo.attributes.color.needsUpdate = true;
+    }
+
+    clear() { this.active = 0; this.geo.setDrawRange(0, 0); }
+  }
+  const field = new ParticleField(CONFIG.MAX_PARTICLES);
+
+  /* ---------- 文字 / 图形 → 像素采样 ---------- */
+  const FONT = '"Arial Black", "Impact", "Helvetica Neue", sans-serif';
+
+  function heartPath(ctx, cx, cy, s) {           // 参数方程心形
+    ctx.beginPath();
+    for (let i = 0; i <= 120; i++) {
+      const a = i / 120 * Math.PI * 2;
+      const x = 16 * Math.pow(Math.sin(a), 3);
+      const y = -(13 * Math.cos(a) - 5 * Math.cos(2 * a) - 2 * Math.cos(3 * a) - Math.cos(4 * a));
+      const px = cx + x * s / 34, py = cy + y * s / 30;
+      i ? ctx.lineTo(px, py) : ctx.moveTo(px, py);
+    }
+    ctx.closePath(); ctx.fill();
+  }
+
+  function samplePixels(cv, step) {
+    const ctx = cv.getContext('2d'), w = cv.width, h = cv.height;
+    const d = ctx.getImageData(0, 0, w, h).data;
+    const raw = [];
+    let minX = 1e9, maxX = -1e9, minY = 1e9, maxY = -1e9;
+    for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) {
+      if (d[(y * w + x) * 4 + 3] > 110) {
+        raw.push(x, y);
+        if (x < minX) minX = x; if (x > maxX) maxX = x;
+        if (y < minY) minY = y; if (y > maxY) maxY = y;
+      }
+    }
+    if (!raw.length) return { pts: [], aspect: 1 };
+    const bh = Math.max(1, maxY - minY), bw = Math.max(1, maxX - minX);
+    const aspect = bw / bh, pts = [];
+    for (let i = 0; i < raw.length; i += 2) {
+      pts.push({
+        x: (raw[i] - minX) / bh - aspect / 2,
+        y: 0.5 - (raw[i + 1] - minY) / bh
+      });
+    }
+    return { pts, aspect };
+  }
+
+  const cache = {};
+  function shapeOf(kind) {
+    if (cache[kind]) return cache[kind];
+    const cv = document.createElement('canvas');
+    const ctx = cv.getContext('2d');
+    let step = 4, res;
+    ctx.fillStyle = '#fff';
+
+    if (kind === 'heart') {
+      cv.width = 512; cv.height = 512; step = 6;
+      heartPath(ctx, 256, 250, 470);
+      res = samplePixels(cv, step);
+    } else if (kind === 'love') {
+      cv.width = 1400; cv.height = 380; step = 4;
+      const fs = 250, gap = fs * 0.2, hs = fs * 0.8;
+      ctx.font = `bold ${fs}px ${FONT}`;
+      ctx.textBaseline = 'middle'; ctx.textAlign = 'left';
+      const wI = ctx.measureText('I').width, wU = ctx.measureText('U').width;
+      const total = wI + gap + hs + gap + wU;
+      let x = (cv.width - total) / 2;
+      ctx.fillText('I', x, cv.height / 2); x += wI + gap;
+      heartPath(ctx, x + hs / 2, cv.height / 2, hs * 0.92); x += hs + gap;
+      ctx.fillText('U', x, cv.height / 2);
+      res = samplePixels(cv, step);
+    } else {                                       // '1' '2' '3'
+      cv.width = 460; cv.height = 620; step = 4;
+      ctx.font = `bold 560px ${FONT}`;
+      ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.fillText(kind, cv.width / 2, cv.height / 2 + 12);
+      res = samplePixels(cv, step);
+    }
+    cache[kind] = res;
+    return res;
+  }
+
+  /* ---------- 把形状变成世界坐标粒子目标 ---------- */
+  const tmpColor = new THREE.Color();
+  function colorAt(u, kind) {                     // u: 0..1 横向位置
+    if (kind === 'heart') return tmpColor.setHSL(0.97 - 0.09 * u, 0.95, 0.63).clone();
+    if (kind === 'love')  return tmpColor.setHSL(0.55 + 0.42 * u, 0.92, 0.64).clone();
+    return tmpColor.setHSL(0.58 + 0.38 * u, 0.9, 0.62).clone();
+  }
+
+  function buildShapeTargets(kind) {
+    const { pts, aspect } = shapeOf(kind);
+    const N = pts.length;
+    if (!N) return [];
+    const vp = viewport();
+    const h = Math.min(vp.h * (kind === 'love' ? 0.42 : 0.52), vp.w * 0.86 / aspect);
+    const minX = -aspect / 2;
+    const DEPTH = kind === 'love' ? CONFIG.SHAPE_DEPTH_LOVE : CONFIG.SHAPE_DEPTH;
+    // ★ 实体实心 3D（非片层、非空心）：
+    //   · 前/后两面各自"全密度"密铺整个字形表面 → 正/背面都是实心盖，看不穿；
+    //   · 内部体积用"连续随机深度"填满（每个粒子取 [-DEPTH/2, +DEPTH/2] 内随机 z），
+    //     不再是固定几层切片，旋转时看不到片层带、读成一块真正的实心立体，
+    //     配合材质不透明 + 深度遮挡（正面粒子遮挡背面），整体是密实 3D 块而非壳层。
+    const BUDGET = CONFIG.MAX_PARTICLES * 0.92;                          // 粒子预算上限
+    const order = [...Array(N).keys()];
+    for (let i = order.length - 1; i > 0; i--) {          // 洗牌，避免采样扫描线感
+      const j = (Math.random() * (i + 1)) | 0;
+      [order[i], order[j]] = [order[j], order[i]];
+    }
+    const list = [];
+    const col = (k, shade) => {                                        // 取第 k 个乱序列的坐标 + 颜色
+      const p = pts[order[k % N]];
+      const base = colorAt((p.x - minX) / aspect, kind);
+      return { x: p.x * h, y: p.y * h, r: base.r * shade, g: base.g * shade, b: base.b * shade };
+    };
+    // 前表面：全密度密铺，z 取薄层带轻微抖动（避免共面 z-fighting），最亮
+    const frontN = Math.min(N, Math.floor(BUDGET * 0.55));
+    for (let k = 0; k < frontN; k++) {
+      const c = col(k, 1.0);
+      c.z = DEPTH / 2 + (Math.random() - 0.5) * DEPTH * 0.05;
+      list.push(c);
+    }
+    // 后表面：全密度密铺，略暗（旋转可见真实厚度与背面）
+    const rem = BUDGET - frontN;
+    const backN = Math.min(N, Math.floor(rem * 0.45));
+    for (let k = 0; k < backN; k++) {
+      const c = col(k, 0.78 + Math.random() * 0.07);
+      c.z = -DEPTH / 2 + (Math.random() - 0.5) * DEPTH * 0.05;
+      list.push(c);
+    }
+    // 内部体积：连续随机深度填满厚度（非切片），读成实体而非片层组合
+    const volumeN = Math.max(0, BUDGET - frontN - backN);
+    for (let k = 0; k < volumeN; k++) {
+      const c = col(k, 0.82 + Math.random() * 0.18);
+      c.z = (Math.random() - 0.5) * DEPTH;
+      list.push(c);
+    }
+    return list;
+  }
+
+  function buildDustTargets() {
+    const vp = viewport(), list = [];
+    for (let i = 0; i < 1500; i++) {
+      const c = tmpColor.setHSL(0.55 + Math.random() * 0.35, 0.7, 0.55 + Math.random() * 0.25).clone();
+      list.push({
+        x: (Math.random() - 0.5) * vp.w * 1.1,
+        y: (Math.random() - 0.5) * vp.h * 1.05,
+        z: (Math.random() - 0.5) * 8,
+        r: c.r * 0.75, g: c.g * 0.75, b: c.b * 0.8
+      });
+    }
+    return list;
+  }
+
+  /* ==================================================================
+   * 4. 气球 & 鲜花
+   * ================================================================== */
+  const balloonGroup = new THREE.Group();
+  const flowerGroup = new THREE.Group();
+  balloonGroup.visible = flowerGroup.visible = false;
+  scene.add(balloonGroup, flowerGroup);
+
+  const BALLOON_COLORS = [0xff2d5e, 0xff8a00, 0x12b9ff, 0x9b30ff, 0x16e0a0, 0xffe000, 0xff4fb0, 0xff1f1f];
+  const FLOWER_COLORS  = [0xff1f5a, 0xffc000, 0xff6a00, 0xa83dff, 0xffffff, 0xff0040, 0x2ee6b0, 0xff5fa0];
+  const rnd = (a, b) => a + Math.random() * (b - a);
+
+  // 程序化气球纹理：左上高光 + 右下阴影渐变，营造立体玻璃光泽（不依赖现场光照）
+  function balloonTexture(hex) {
+    const c = document.createElement('canvas'); c.width = c.height = 256;
+    const g = c.getContext('2d');
+    const col = new THREE.Color(hex);
+    const light = col.clone().lerp(new THREE.Color(0xffffff), 0.6);
+    const dark  = col.clone().lerp(new THREE.Color(0x000000), 0.45);
+    const grd = g.createRadialGradient(82, 74, 10, 128, 128, 152);
+    grd.addColorStop(0, '#' + light.getHexString());
+    grd.addColorStop(0.55, '#' + col.getHexString());
+    grd.addColorStop(1, '#' + dark.getHexString());
+    g.fillStyle = grd; g.fillRect(0, 0, 256, 256);
+    const hi = g.createRadialGradient(76, 66, 2, 76, 66, 50);
+    hi.addColorStop(0, 'rgba(255,255,255,0.92)');
+    hi.addColorStop(1, 'rgba(255,255,255,0)');
+    g.fillStyle = hi; g.fillRect(0, 0, 256, 256);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  }
+  // 程序化花瓣纹理：瓣尖深、瓣根浅，带自然渐变
+  function petalTexture(hex) {
+    const c = document.createElement('canvas'); c.width = c.height = 128;
+    const g = c.getContext('2d');
+    const col = new THREE.Color(hex);
+    const tip = col.clone().lerp(new THREE.Color(0x000000), 0.18);
+    const root = col.clone().lerp(new THREE.Color(0xffffff), 0.5);
+    const grd = g.createLinearGradient(64, 6, 64, 122);
+    grd.addColorStop(0, '#' + tip.getHexString());
+    grd.addColorStop(0.5, '#' + col.getHexString());
+    grd.addColorStop(1, '#' + root.getHexString());
+    g.fillStyle = grd; g.fillRect(0, 0, 128, 128);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  }
+
+  const balloonBodyGeo = new THREE.SphereGeometry(0.5, 36, 28);
+  const balloonKnotGeo = new THREE.ConeGeometry(0.11, 0.22, 12);
+  const balloonStringGeo = new THREE.CylinderGeometry(0.005, 0.005, 1.4, 6);
+  const balloons = [];
+  function makeBalloon() {
+    const g = new THREE.Group();
+    const color = BALLOON_COLORS[(Math.random() * BALLOON_COLORS.length) | 0];
+    const tex = balloonTexture(color);
+    const mat = new THREE.MeshPhysicalMaterial({
+      map: tex, roughness: 0.15, metalness: 0.0,
+      emissive: new THREE.Color(color), emissiveMap: tex, emissiveIntensity: 0.25,
+      clearcoat: 1.0, clearcoatRoughness: 0.22, sheen: 0.4, sheenColor: new THREE.Color(0xffffff)
+    });
+    const body = new THREE.Mesh(balloonBodyGeo, mat);
+    body.scale.set(1, 1.3, 1); body.position.y = 0.66;
+    const knot = new THREE.Mesh(balloonKnotGeo, mat);
+    knot.rotation.x = Math.PI; knot.position.y = 0.01;
+    const str = new THREE.Mesh(balloonStringGeo,
+      new THREE.MeshBasicMaterial({ color: 0xffffff, transparent: true, opacity: 0.3 }));
+    str.position.y = -0.72;
+    g.add(body, knot, str);
+    g.userData = { vy: rnd(1.6, 3.2), sway: rnd(0.4, 1.2), phase: Math.random() * 6.28, spin: rnd(-0.5, 0.5) };
+    return g;
+  }
+
+  const petalGeo = new THREE.SphereGeometry(0.17, 14, 10);
+  petalGeo.scale(1.7, 0.22, 1.05);
+  const coreGeo = new THREE.SphereGeometry(0.12, 18, 14);
+  const stemGeo = new THREE.CylinderGeometry(0.02, 0.024, 1.0, 8);
+  const leafGeo = new THREE.SphereGeometry(0.13, 10, 8); leafGeo.scale(1.8, 0.12, 0.95);
+  const stamenGeo = new THREE.SphereGeometry(0.022, 6, 6);
+  const flowers = [];
+  function makeFlower() {
+    const g = new THREE.Group();
+    const color = FLOWER_COLORS[(Math.random() * FLOWER_COLORS.length) | 0];
+    const ptex = petalTexture(color);
+    const pmat = new THREE.MeshStandardMaterial({
+      map: ptex, color: 0xffffff, roughness: 0.5, metalness: 0,
+      emissive: new THREE.Color(color), emissiveMap: ptex, emissiveIntensity: 0.18,
+      side: THREE.DoubleSide
+    });
+    // 外圈 8 瓣 + 内圈 6 瓣错位叠放 → 饱满立体
+    const layers = [{ n: 8, r: 0.24, y: 0.0, tilt: 0.26 }, { n: 6, r: 0.14, y: 0.05, tilt: 0.34 }];
+    for (const L of layers) {
+      for (let i = 0; i < L.n; i++) {
+        const p = new THREE.Mesh(petalGeo, pmat);
+        const a = i / L.n * Math.PI * 2 + (L.r < 0.2 ? 0.26 : 0);
+        p.position.set(Math.cos(a) * L.r, L.y, Math.sin(a) * L.r);
+        p.rotation.y = -a; p.rotation.z = L.tilt;
+        g.add(p);
+      }
+    }
+    // 花蕊：渐变黄芯 + 细密花蕊点
+    const core = new THREE.Mesh(coreGeo, new THREE.MeshStandardMaterial({
+      color: 0xffd23f, emissive: 0x6b4e00, emissiveIntensity: 0.45, roughness: 0.4
+    }));
+    core.position.y = 0.07;
+    const stamenMat = new THREE.MeshStandardMaterial({ color: 0x7a5a00, emissive: 0x3a2a00 });
+    for (let i = 0; i < 6; i++) {
+      const s = new THREE.Mesh(stamenGeo, stamenMat);
+      const a = i / 6 * 6.2832;
+      s.position.set(Math.cos(a) * 0.07, 0.11, Math.sin(a) * 0.07);
+      g.add(s);
+    }
+    const stem = new THREE.Mesh(stemGeo, new THREE.MeshStandardMaterial({ color: 0x3fa34d, roughness: 0.7 }));
+    stem.position.y = -0.62;
+    // 两片叶子
+    const leafMat = new THREE.MeshStandardMaterial({ color: 0x4caf50, roughness: 0.6, side: THREE.DoubleSide });
+    for (let i = 0; i < 2; i++) {
+      const leaf = new THREE.Mesh(leafGeo, leafMat);
+      leaf.position.set(i ? 0.17 : -0.17, -0.42, 0);
+      leaf.rotation.set(0.3, i ? 0.7 : -0.7, i ? -0.9 : 0.9);
+      g.add(leaf);
+    }
+    g.add(core, stem);
+    g.userData = { vy: rnd(0.9, 1.9), sway: rnd(0.3, 0.9), phase: Math.random() * 6.28, spin: rnd(-1.6, 1.6) };
+    return g;
+  }
+
+  for (let i = 0; i < 44; i++) { const b = makeBalloon(); balloons.push(b); balloonGroup.add(b); }
+  for (let i = 0; i < 38; i++) { const f = makeFlower();  flowers.push(f);   flowerGroup.add(f); }
+
+  function resetFloaters() {
+    const vp = viewport();
+    balloons.forEach(b => {
+      b.scale.setScalar(rnd(0.7, 1.0));
+      b.position.set(rnd(-vp.w * 0.55, vp.w * 0.55), rnd(-16, -3), rnd(-9, -1));
+      b.rotation.z = rnd(-0.25, 0.25);
+    });
+    flowers.forEach(f => {
+      f.scale.setScalar(rnd(0.6, 0.95));
+      f.position.set(rnd(-vp.w * 0.55, vp.w * 0.55), rnd(-14, -2), rnd(-8, -1));
+      f.rotation.set(rnd(-0.7, -0.2), Math.random() * 6.28, rnd(-0.4, 0.4));
+    });
+  }
+
+  function updateFloaters(dt, t) {
+    const top = viewport().h * 0.62 + 6;
+    balloonGroup.visible = flowerGroup.visible = (state === 'LOVE');
+    if (!balloonGroup.visible) return;
+    for (const b of balloons) {
+      const u = b.userData;
+      b.position.y += u.vy * dt;
+      b.position.x += Math.sin(t * u.sway + u.phase) * 0.5 * dt;
+      b.rotation.z = Math.sin(t * u.sway + u.phase) * 0.16;
+      if (b.position.y > top) {
+        b.position.y = -top - rnd(0, 6);
+        b.position.x = rnd(-viewport().w * 0.55, viewport().w * 0.55);
+      }
+    }
+    for (const f of flowers) {
+      const u = f.userData;
+      f.position.y += u.vy * dt;
+      f.position.x += Math.sin(t * u.sway + u.phase) * 0.45 * dt;
+      f.rotation.y += u.spin * dt;
+      if (f.position.y > top) {
+        f.position.y = -top - rnd(0, 6);
+        f.position.x = rnd(-viewport().w * 0.55, viewport().w * 0.55);
+      }
+    }
+  }
+
+  /* ==================================================================
+   * 4.5 裸眼3D 烟花（仅 I❤U 状态绽放）
+   *    - 真实三段式：升空(带金色火花尾迹、轻微摇摆) → 到顶炸开 → 余烬下落
+   *    - 热力色(白热→色相→黯淡) + 逐颗闪烁(twinkle) + 重力下垂 + 空气阻力 + 淡烟
+   *    - 透视相机 + 三维球面爆开 + 不同景深 → 裸眼3D 纵深
+   * ================================================================== */
+  const fireworksGroup = new THREE.Group();
+  fireworksGroup.visible = false;
+  scene.add(fireworksGroup);
+
+  // 柔和发光贴图：中心白亮 → 边缘透明（叠加混合形成光晕/泛光，贴近真实余烬辉光）
+  const fwGlowTex = (() => {
+    const c = document.createElement('canvas'); c.width = c.height = 64;
+    const g = c.getContext('2d');
+    const grd = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grd.addColorStop(0,    'rgba(255,255,255,1)');
+    grd.addColorStop(0.12, 'rgba(255,255,255,0.92)');
+    grd.addColorStop(0.35, 'rgba(255,255,255,0.40)');
+    grd.addColorStop(0.7,  'rgba(255,255,255,0.09)');
+    grd.addColorStop(1,    'rgba(255,255,255,0)');
+    g.fillStyle = grd; g.fillRect(0, 0, 64, 64);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  })();
+
+  // 真实烟花配色：暖金/红/粉/橙为主，点缀蓝绿紫（克制饱和度，避免塑料感）
+  const FW_PALETTE = [
+    [1.00, 0.78, 0.28], [1.00, 0.62, 0.20], [1.00, 0.42, 0.30],
+    [1.00, 0.50, 0.55], [0.98, 0.36, 0.42], [0.45, 0.80, 0.95],
+    [0.55, 0.95, 0.60], [0.72, 0.50, 0.98]
+  ];
+  const palColor = () => {
+    const c = FW_PALETTE[(Math.random() * FW_PALETTE.length) | 0];
+    const k = 0.9 + Math.random() * 0.2;
+    return [c[0]*k, c[1]*k, c[2]*k];
+  };
+
+  const fireworks = [];     // 当前活跃烟花
+  let fwTimer = rnd(0.3, 0.9);
+  const FW_MAX = 6;         // 同时存在烟花上限
+  const FW_TRAIL = 4;       // 每颗余烬的拖尾发光点数（彗星式短尾）
+
+  function clearFireworks() {
+    for (const fw of fireworks) {
+      if (fw.shell) { fireworksGroup.remove(fw.shell); fw.shell.material.dispose(); }
+      if (fw.trail) { fireworksGroup.remove(fw.trail.pts); fw.trail.geo.dispose(); fw.trail.mat.dispose(); }
+      if (fw.smoke) { fireworksGroup.remove(fw.smoke); fw.smoke.material.dispose(); }
+      if (fw.burst) {
+        fireworksGroup.remove(fw.burst.points); fireworksGroup.remove(fw.burst.trails);
+        if (fw.burst.flash) fireworksGroup.remove(fw.burst.flash);
+        fw.burst.geo.dispose(); fw.burst.tgeo.dispose();
+        fw.burst.points.material.dispose(); fw.burst.trails.material.dispose();
+        if (fw.burst.flash) fw.burst.flash.material.dispose();
+      }
+    }
+    fireworks.length = 0;
+  }
+
+  // 升空火箭：底部升空，带金色火花尾迹，到顶炸开
+  function launchFirework() {
+    const vp = viewport();
+    const fw = {
+      phase: 'rise',
+      x: rnd(-vp.w * 0.4, vp.w * 0.4), z: rnd(-6, 2.5),
+      y: -vp.h * 0.34, vy: rnd(9, 13),
+      targetY: rnd(vp.h * 0.18, vp.h * 0.52),
+      shell: null, trail: null, smoke: null, burst: null
+    };
+    const shell = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: fwGlowTex, color: 0xffe6a0, transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+    shell.position.set(fw.x, fw.y, fw.z); shell.scale.setScalar(0.55);
+    fireworksGroup.add(shell); fw.shell = shell;
+    // 升空尾迹：沿路径拖一串渐隐金色余烬（环形缓冲）
+    const TN = 10;
+    const tpos = new Float32Array(TN * 3), tcol = new Float32Array(TN * 3);
+    const tgeo = new THREE.BufferGeometry();
+    tgeo.setAttribute('position', new THREE.BufferAttribute(tpos, 3));
+    tgeo.setAttribute('color', new THREE.BufferAttribute(tcol, 3));
+    const tmat = new THREE.PointsMaterial({ size: 0.34, map: fwGlowTex, vertexColors: true,
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true });
+    const trail = new THREE.Points(tgeo, tmat);
+    fireworksGroup.add(trail); fw.trail = { pts: trail, geo: tgeo, mat: tmat, tpos, tcol, TN, buf: [] };
+    fireworks.push(fw);
+  }
+
+  function explodeFirework(fw) {
+    const N = 130 + (Math.random() * 60 | 0);
+    const base = palColor();
+    const crackle = Math.random() < 0.3;
+    const willow = Math.random() < 0.5;     // 柳枝/菊花型：更慢更下垂
+    const rMax = willow ? rnd(3.2, 4.6) : rnd(2.4, 3.8);
+    const pos = new Float32Array(N * 3), vel = new Float32Array(N * 3);
+    const hue = new Float32Array(N * 3), life = new Float32Array(N), maxLife = new Float32Array(N);
+    const freq = new Float32Array(N), ph = new Float32Array(N);
+    const speedBase = rMax / rnd(0.95, 1.15);
+    for (let i = 0; i < N; i++) {
+      // 球面均匀方向 + 壳层抖动（真实爆开非完美球面，带厚度）
+      const u = Math.random() * 2 - 1, th = Math.random() * 6.2832, r = Math.sqrt(1 - u * u);
+      const sp = speedBase * (0.55 + Math.random() * 0.45);
+      vel[i*3] = r*Math.cos(th)*sp; vel[i*3+1] = u*sp; vel[i*3+2] = r*Math.sin(th)*sp;
+      pos[i*3] = fw.x; pos[i*3+1] = fw.y; pos[i*3+2] = fw.z;
+      const cc = (crackle && i % 7 === 0) ? palColor() : base;
+      hue[i*3] = cc[0]; hue[i*3+1] = cc[1]; hue[i*3+2] = cc[2];
+      const ml = (willow ? rnd(1.8, 2.8) : rnd(1.3, 2.1)); life[i] = ml; maxLife[i] = ml;
+      freq[i] = rnd(8, 20); ph[i] = Math.random() * 6.2832;
+    }
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute('position', new THREE.BufferAttribute(pos, 3));
+    geo.setAttribute('color', new THREE.BufferAttribute(new Float32Array(N * 3), 3));
+    const points = new THREE.Points(geo, new THREE.PointsMaterial({
+      size: 0.42, map: fwGlowTex, vertexColors: true, transparent: true,
+      depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true }));
+    const tPos = new Float32Array(N * FW_TRAIL * 3), tCol = new Float32Array(N * FW_TRAIL * 3);
+    const tgeo = new THREE.BufferGeometry();
+    tgeo.setAttribute('position', new THREE.BufferAttribute(tPos, 3));
+    tgeo.setAttribute('color', new THREE.BufferAttribute(tCol, 3));
+    const trails = new THREE.Points(tgeo, new THREE.PointsMaterial({
+      size: 0.3, map: fwGlowTex, vertexColors: true, transparent: true,
+      depthWrite: false, blending: THREE.AdditiveBlending, sizeAttenuation: true }));
+    const flash = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: fwGlowTex, color: new THREE.Color(base[0], base[1], base[2]),
+      transparent: true, depthWrite: false, blending: THREE.AdditiveBlending }));
+    flash.position.set(fw.x, fw.y, fw.z); flash.scale.setScalar(rnd(2.6, 3.8));
+    fireworksGroup.add(points, trails, flash);
+    fw.burst = { points, trails, geo, tgeo, tPos, tCol, pos, vel, hue, life, maxLife, N,
+                 freq, ph, flash, age: 0,
+                 gravity: willow ? rnd(2.0, 2.8) : rnd(1.4, 2.2),
+                 drag: willow ? 0.972 : 0.97 };
+    // 淡烟：爆开后一缕灰烟缓慢扩散淡出，增强真实感（很淡，避免塑料感）
+    const smoke = new THREE.Sprite(new THREE.SpriteMaterial({
+      map: fwGlowTex, color: 0x6b6b72, transparent: true, opacity: 0.0,
+      depthWrite: false, blending: THREE.NormalBlending }));
+    smoke.position.set(fw.x, fw.y, fw.z); smoke.scale.setScalar(1.5);
+    fireworksGroup.add(smoke); fw.smoke = smoke; fw.smokeAge = 0;
+  }
+
+  function updateRise(fw, dt) {
+    fw.y += fw.vy * dt; fw.vy -= 5.5 * dt;          // 上升 + 重力减速
+    fw.x += Math.sin(fw.y * 0.5) * 0.02;            // 轻微摇摆，更自然
+    fw.shell.position.set(fw.x, fw.y, fw.z);
+    // 尾迹：把当前位置压入环形缓冲，最旧的最暗（金色火花拖尾）
+    const tr = fw.trail;
+    tr.buf.unshift([fw.x, fw.y, fw.z]);
+    if (tr.buf.length > tr.TN) tr.buf.pop();
+    const last = tr.buf[tr.buf.length - 1] || [fw.x, fw.y, fw.z];
+    for (let k = 0; k < tr.TN; k++) {
+      const p = tr.buf[k] || last;
+      const fade = 1 - k / tr.TN;
+      tr.tpos[k*3] = p[0]; tr.tpos[k*3+1] = p[1]; tr.tpos[k*3+2] = p[2];
+      tr.tcol[k*3] = 1.0 * fade; tr.tcol[k*3+1] = 0.7 * fade; tr.tcol[k*3+2] = 0.25 * fade;
+    }
+    tr.geo.attributes.position.needsUpdate = true;
+    tr.geo.attributes.color.needsUpdate = true;
+    if (fw.y >= fw.targetY || fw.vy <= 0) {
+      fireworksGroup.remove(fw.shell); fw.shell.material.dispose(); fw.shell = null;
+      fireworksGroup.remove(fw.trail.pts); fw.trail.geo.dispose(); fw.trail.mat.dispose(); fw.trail = null;
+      fw.phase = 'burst'; explodeFirework(fw);
+    }
+  }
+
+  function updateBurst(fw, dt, t) {
+    const b = fw.burst; b.age += dt;
+    const dk = Math.pow(b.drag, dt * 60);
+    let alive = 0;
+    const colAttr = b.geo.attributes.color.array;
+    for (let i = 0; i < b.N; i++) {
+      if (b.life[i] <= 0) {
+        colAttr[i*3] = colAttr[i*3+1] = colAttr[i*3+2] = 0;
+        for (let k = 0; k < FW_TRAIL * 3; k++) { b.tPos[i*FW_TRAIL*3+k] = b.pos[i*3+(k%3)]; b.tCol[i*FW_TRAIL*3+k] = 0; }
+        continue;
+      }
+      alive++;
+      b.vel[i*3+1] -= b.gravity * dt;                // 重力下垂
+      b.vel[i*3] *= dk; b.vel[i*3+1] *= dk; b.vel[i*3+2] *= dk;  // 空气阻力
+      b.pos[i*3]   += b.vel[i*3]   * dt;
+      b.pos[i*3+1] += b.vel[i*3+1] * dt;
+      b.pos[i*3+2] += b.vel[i*3+2] * dt;
+      b.life[i] -= dt;
+      const f = Math.max(0, b.life[i] / b.maxLife[i]);
+      const fade = f * f;                            // 末段更快黯淡
+      const whiteAmt = b.age < 0.18 ? (1 - b.age / 0.18) : 0;   // 白热起始 → 色相
+      const flick = 0.55 + 0.45 * Math.sin(t * b.freq[i] + b.ph[i]);  // 逐颗闪烁
+      const br = fade * flick;
+      const r  = (1 * whiteAmt + b.hue[i*3]   * (1 - whiteAmt)) * br;
+      const g  = (1 * whiteAmt + b.hue[i*3+1] * (1 - whiteAmt)) * br;
+      const bl = (1 * whiteAmt + b.hue[i*3+2] * (1 - whiteAmt)) * br;
+      colAttr[i*3] = r; colAttr[i*3+1] = g; colAttr[i*3+2] = bl;
+      // 拖尾：沿速度反方向若干渐隐发光点（短彗星尾）
+      const hx = b.pos[i*3], hy = b.pos[i*3+1], hz = b.pos[i*3+2];
+      const tl = 0.5 * (0.5 + f * 0.8);
+      for (let k = 0; k < FW_TRAIL; k++) {
+        const off = tl * (k + 1) / FW_TRAIL;
+        const fa = fade * (1 - (k + 1) / (FW_TRAIL + 1));
+        const o = (i * FW_TRAIL + k) * 3;
+        b.tPos[o]   = hx - b.vel[i*3]   * off;
+        b.tPos[o+1] = hy - b.vel[i*3+1] * off;
+        b.tPos[o+2] = hz - b.vel[i*3+2] * off;
+        b.tCol[o]   = r * fa; b.tCol[o+1] = g * fa; b.tCol[o+2] = bl * fa;
+      }
+    }
+    b.geo.attributes.position.needsUpdate = true;
+    b.geo.attributes.color.needsUpdate = true;
+    b.tgeo.attributes.position.needsUpdate = true;
+    b.tgeo.attributes.color.needsUpdate = true;
+    if (b.flash) {
+      const fa = Math.max(0, 1 - b.age / 0.3);
+      b.flash.material.opacity = fa;
+      b.flash.scale.setScalar(b.flash.scale.x + dt * 8);
+      if (fa <= 0) { fireworksGroup.remove(b.flash); b.flash.material.dispose(); b.flash = null; }
+    }
+    if (fw.smoke) {
+      fw.smokeAge += dt; const sa = fw.smokeAge;
+      fw.smoke.position.set(fw.x, fw.y - 0.4 * sa, fw.z);
+      fw.smoke.scale.setScalar(1.5 + sa * 2.2);
+      fw.smoke.material.opacity = Math.min(0.12, sa * 0.18) * Math.max(0, 1 - sa / 2.2);
+      if (sa > 2.4) { fireworksGroup.remove(fw.smoke); fw.smoke.material.dispose(); fw.smoke = null; }
+    }
+    if (alive === 0 && !b.flash && !fw.smoke) {
+      fireworksGroup.remove(b.points); fireworksGroup.remove(b.trails);
+      b.geo.dispose(); b.tgeo.dispose(); b.points.material.dispose(); b.trails.material.dispose();
+      fw.phase = 'dead';
+    }
+  }
+
+  function updateFireworks(dt, t) {
+    fireworksGroup.visible = (state === 'LOVE');
+    if (!fireworksGroup.visible) { if (fireworks.length) clearFireworks(); fwTimer = rnd(0.3, 0.9); return; }
+    fwTimer -= dt;
+    if (fwTimer <= 0 && fireworks.length < FW_MAX) { launchFirework(); fwTimer = rnd(0.5, 1.3); }
+    for (const fw of fireworks) {
+      if (fw.phase === 'rise') updateRise(fw, dt);
+      else if (fw.phase === 'burst') updateBurst(fw, dt, t);
+    }
+    for (let i = fireworks.length - 1; i >= 0; i--) if (fireworks[i].phase === 'dead') fireworks.splice(i, 1);
+  }
+  /* ==================================================================
+   * 5. 照片球
+   * ================================================================== */
+  const photoGroup = new THREE.Group();
+  photoGroup.visible = false;
+  scene.add(photoGroup);
+  const photos = [];
+  let photosBuilt = false;
+
+  function placeholderTexture(i) {
+    const c = document.createElement('canvas'); c.width = 900; c.height = 620;
+    const g = c.getContext('2d');
+    const h1 = (i * 47) % 360, h2 = (h1 + 60) % 360;
+    const grd = g.createLinearGradient(0, 0, 900, 620);
+    grd.addColorStop(0, `hsl(${h1},78%,58%)`);
+    grd.addColorStop(1, `hsl(${h2},82%,44%)`);
+    g.fillStyle = grd; g.fillRect(0, 0, 900, 620);
+    g.globalAlpha = 0.16; g.fillStyle = '#fff';
+    for (let k = 0; k < 26; k++) {
+      g.beginPath();
+      g.arc(Math.random() * 900, Math.random() * 620, Math.random() * 90, 0, 6.2832);
+      g.fill();
+    }
+    g.globalAlpha = 1;
+    g.fillStyle = 'rgba(255,255,255,.92)';
+    g.font = 'bold 78px ' + FONT;
+    g.textAlign = 'center'; g.textBaseline = 'middle';
+    g.fillText('PHOTO ' + (i + 1), 450, 300);
+    g.font = 'italic 30px Georgia, serif';
+    g.fillStyle = 'rgba(255,255,255,.75)';
+    g.fillText('your memory here', 450, 382);
+    const t = new THREE.CanvasTexture(c);
+    t.colorSpace = THREE.SRGBColorSpace;
+    return t;
+  }
+
+  function loadTexture(src, i) {
+    return new Promise(res => {
+      const loader = new THREE.TextureLoader();
+      loader.setCrossOrigin('anonymous');
+      loader.load(src,
+        t => { t.colorSpace = THREE.SRGBColorSpace; res(t); },
+        undefined,
+        () => res(placeholderTexture(i)));
+    });
+  }
+
+  function photoGeometryFor(tex) {
+    const img = tex.image || {};
+    const ar = (img.width && img.height) ? img.width / img.height : CONFIG.PHOTO_W / CONFIG.PHOTO_H;
+    const h = CONFIG.PHOTO_H, w = Math.min(CONFIG.PHOTO_W * 1.35, h * ar);
+    return new THREE.PlaneGeometry(w, h);
+  }
+
+  // 柔光渐变纹理：中心透明、外圈橙色光晕（用于"调取放大"时的发光边框，
+  // 而不是一块实心橙色矩形，贴近参考视频里照片被拉出中央的辉光）
+  const glowTex = (() => {
+    const c = document.createElement('canvas'); c.width = c.height = 256;
+    const g = c.getContext('2d');
+    // 四边橙色发光描边（中间全透明），形成"发光相框"而非实心色块
+    g.clearRect(0, 0, 256, 256);
+    g.strokeStyle = 'rgba(255,172,78,0.95)'; g.lineWidth = 12;
+    g.shadowColor = 'rgba(255,138,38,0.95)'; g.shadowBlur = 30;
+    g.strokeRect(20, 20, 216, 216);
+    g.shadowBlur = 12; g.strokeRect(20, 20, 216, 216);
+    const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t;
+  })();
+
+  function addPhotoMesh(tex) {
+    const i = photos.length;
+    const geo = photoGeometryFor(tex);
+    const w = geo.parameters.width, h = geo.parameters.height;
+    const mat = new THREE.MeshBasicMaterial({ map: tex, transparent: true, opacity: 1, side: THREE.DoubleSide });
+    const mesh = new THREE.Mesh(geo, mat);
+    mesh.renderOrder = 2;
+
+    // 白色相框边：略大于照片、衬在后面，露出白边（与参考视频里的小照片一致）
+    const frame = new THREE.Mesh(
+      new THREE.PlaneGeometry(w + 0.17, h + 0.17),
+      new THREE.MeshBasicMaterial({ color: 0xffffff, side: THREE.DoubleSide })
+    );
+    frame.position.z = -0.012; frame.renderOrder = 1;
+    mesh.add(frame);
+
+    // 橙色发光外框：仅"调取放大到中央"时显示，模拟视频里照片被拉出时的辉光
+    const glow = new THREE.Mesh(
+      new THREE.PlaneGeometry(w + 0.72, h + 0.72),
+      new THREE.MeshBasicMaterial({ map: glowTex, color: 0xffffff, transparent: true, opacity: .9,
+        blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide })
+    );
+    glow.position.z = -0.026; glow.renderOrder = 0; glow.visible = false;
+    mesh.add(glow);
+
+    // 每张照片固定一个随机尺寸系数（创建时确定，之后每次炸开保持不变 → 终态一致）
+    mesh.userData.sizeScale = CONFIG.PHOTO_SIZE_MIN +
+      Math.random() * (CONFIG.PHOTO_SIZE_MAX - CONFIG.PHOTO_SIZE_MIN);
+    mesh.userData.base = {
+      pos: new THREE.Vector3(), quat: new THREE.Quaternion(), scale: new THREE.Vector3(1, 1, 1)
+    };
+    mesh.userData.frame = frame; mesh.userData.glow = glow;
+    photos.push(mesh);
+    photoGroup.add(mesh);
+    return i;
+  }
+
+  // 全向 billboard：照片局部四元数 = 照片球四元数的逆 → 世界朝向恒为单位(正对相机)，
+  // 球转到任意角度每一张照片都清晰可辨、不露白框背面。
+  const invPhotoQ = new THREE.Quaternion();
+  const _fv = new THREE.Vector3();
+
+  // ★ 球面分布：每次调用都重新随机（黄金角分层 + 整体随机相位 + 逐张随机抖动），
+  //   所以每次炸开"每个粒子、每张照片的位置都不一样"；但始终均匀铺满同一个球面，
+  //   因此最终画面恒为"发光粒子球 + 球面散布带白边照片"（过程随机、终态一致）。
+  function layoutPhotoSphere() {
+    const n = photos.length || 1;
+    const R = CONFIG.SPHERE_R, s = CONFIG.PHOTO_BASE_SCALE;
+    const golden = Math.PI * (3 - Math.sqrt(5));
+    const phase = Math.random() * Math.PI * 2;         // 整体随机相位：每次球都换一个朝向
+    photos.forEach((p, i) => {
+      const a = phase + i * golden + (Math.random() - 0.5) * 0.7;
+      const y = 1 - (i + 0.5) / n * 2;                  // 分层俯仰 -1..1
+      const yy = Math.max(-0.9, Math.min(0.9, y + (Math.random() - 0.5) * 0.45));
+      const rr = Math.sqrt(Math.max(0, 1 - yy * yy));
+      const rad = R * (0.93 + Math.random() * 0.14);   // 半径轻抖 → 球面有厚度感
+      const pos = new THREE.Vector3(Math.cos(a) * rr * rad, yy * rad, Math.sin(a) * rr * rad);
+      // 位置在球面（随球转）；朝向由 tick 每帧做 billboard → 始终正面朝相机，
+      // 这样球面每一张照片都清晰可辨，不会露出白框背面（与参考视频一致）
+      const quat = new THREE.Quaternion();
+      // 大小不一：基础尺寸 × 每张自己的随机系数（已限幅，不过大/过小）
+      p.position.copy(pos); p.quaternion.copy(quat);
+      p.scale.setScalar(s * (p.userData.sizeScale || 1));
+      p.userData.base.pos.copy(pos);
+      p.userData.base.quat.copy(quat);
+      p.userData.base.scale.copy(p.scale);
+      p.userData.angle = Math.atan2(pos.x, pos.z);     // 绕 Y 方位角，供 frontPhotoIndex 用
+      p.material.opacity = 1; p.material.color.setScalar(1);
+      if (p.userData.glow) p.userData.glow.visible = false;
+    });
+  }
+  function layoutPhotos() { layoutPhotoSphere(); }     // 兼容旧调用名（resize 等）
+
+  const DEFAULT_PHOTOS = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];   // 未添加时显示的占位图
+  let buildToken = 0;
+  async function buildPhotos(sources) {
+    const my = ++buildToken;
+    photos.forEach(p => {
+      photoGroup.remove(p);
+      p.children.forEach(c => { c.geometry.dispose(); c.material.dispose(); });
+      p.geometry.dispose(); p.material.dispose();
+    });
+    photos.length = 0;
+    const list = (sources && sources.length) ? sources : DEFAULT_PHOTOS;
+    // 并行加载全部纹理后按原顺序建 mesh：比逐张 await 快得多，也把异步窗口压到
+    // 最短，避免连续添加时多次构建交错清空 photos（这正是"多张只生效一张"的帮凶）。
+    const texs = await Promise.all(list.map((src, i) =>
+      (typeof src === 'string' && src) ? loadTexture(src, i) : Promise.resolve(placeholderTexture(i))));
+    if (my !== buildToken) return false; // 已被更新的构建取代：放弃，不写回 photos
+    texs.forEach(tex => addPhotoMesh(tex));
+    layoutPhotos();
+    photosBuilt = true;
+    return true;
+  }
+
+  /* ---------- 变换补间（用于放大 / 缩回） ---------- */
+  const tweens = [];
+  function tweenTo(obj, pos, quat, scale, speed, onDone) {
+    const t = { obj, pos, quat, scale, speed, onDone };
+    const i = tweens.findIndex(x => x.obj === obj);
+    i >= 0 ? (tweens[i] = t) : tweens.push(t);
+  }
+  function updateTweens(dt) {
+    for (let i = tweens.length - 1; i >= 0; i--) {
+      const tw = tweens[i], o = tw.obj;
+      const k = 1 - Math.pow(0.0016, dt * tw.speed);
+      o.position.lerp(tw.pos, k);
+      o.quaternion.slerp(tw.quat, k);
+      o.scale.lerp(tw.scale, k);
+      // 完成判定只看位置与缩放：照片朝向由 tick 的 billboard 统一控制，
+      // 不把四元数纳入判定，避免入场/缩回补间因朝向被覆盖而永远不结束。
+      if (o.position.distanceTo(tw.pos) < 0.012 &&
+          Math.abs(o.scale.x - tw.scale.x) < 0.012) {
+        o.position.copy(tw.pos); o.quaternion.copy(tw.quat); o.scale.copy(tw.scale);
+        tweens.splice(i, 1);
+        tw.onDone && tw.onDone();
+      }
+    }
+  }
+
+  /* ---------- 照片球交互状态 ---------- */
+  let zoomIdx = -1;                 // 当前被放大的照片（已被 attach 到 scene）
+  let zoomStage = 'gallery';        // gallery | zoomed | shrunk
+  let hasZoomed = false;
+  let pinchCooldownUntil = 0;       // 调取冷却到期时间（防止一次捏合连触放大/缩回）
+  const ZOOM_POS = new THREE.Vector3(0, 0, CAM_Z - 6.2);
+  const ZOOM_QUAT = new THREE.Quaternion();
+
+  function frontPhotoIndex() {
+    // 全向旋转下，"正对屏幕"= 世界坐标 z 最大（最靠近相机）的那一张
+    let best = 0, bestZ = -Infinity;
+    for (let i = 0; i < photos.length; i++) {
+      _fv.copy(photos[i].userData.base.pos).applyQuaternion(photoGroup.quaternion);
+      if (_fv.z > bestZ) { bestZ = _fv.z; best = i; }
+    }
+    return best;
+  }
+
+  function worldTransformOf(photo) {   // 照片在圆环上的"原始"世界变换
+    photoGroup.updateWorldMatrix(true, false);   // 全向 quaternion 后确保 matrixWorld 最新
+    const m = photoGroup.matrixWorld.clone().multiply(
+      new THREE.Matrix4().compose(
+        photo.userData.base.pos, photo.userData.base.quat, photo.userData.base.scale));
+    const p = new THREE.Vector3(), q = new THREE.Quaternion(), s = new THREE.Vector3();
+    m.decompose(p, q, s);
+    return { p, q, s };
+  }
+
+  function startZoom(i) {
+    if (i < 0 || i >= photos.length || zoomIdx === i) return;
+    if (zoomIdx >= 0) returnPhoto(zoomIdx);
+    const photo = photos[i];
+    scene.attach(photo);                       // 保留世界变换，脱离照片球
+    zoomIdx = i; zoomStage = 'zoomed'; hasZoomed = true;
+    photo.userData.glow.visible = true;        // 橙色发光外框：视频里照片被拉到中央的辉光
+    photo.material.color.setScalar(1);
+    tweenTo(photo, ZOOM_POS.clone(), ZOOM_QUAT.clone(),
+      new THREE.Vector3().setScalar(CONFIG.PHOTO_ZOOM_SCALE), 2.4);
+  }
+
+  function returnPhoto(i) {
+    const photo = photos[i];
+    if (!photo) return;
+    if (photo.userData.glow) photo.userData.glow.visible = false;
+    const { p, s } = worldTransformOf(photo);
+    tweenTo(photo, p, ZOOM_QUAT.clone(), s, 2.2, () => {   // 缩回时保持正面朝相机
+      if (photo.parent !== photoGroup) {
+        photoGroup.attach(photo);
+        photo.position.copy(photo.userData.base.pos);
+        photo.quaternion.copy(photo.userData.base.quat);
+        photo.scale.copy(photo.userData.base.scale);
+      }
+    });
+    if (zoomIdx === i) zoomIdx = -1;
+  }
+
+  function releaseZoom() {
+    if (zoomIdx < 0) return;
+    returnPhoto(zoomIdx);
+    zoomStage = 'shrunk';
+  }
+
+  /* ---------- 粒子材质模式：实心图案 / 发光粒子球 ---------- */
+  function setParticleSolid() {          // 数字/I❤U/💗：不透明实心、正面遮挡背面
+    field.expand = 0;                  // 回到实心图案：离心膨胀归零
+    field.mat.blending = THREE.NormalBlending;
+    field.mat.transparent = false; field.mat.depthWrite = true;
+    field.mat.alphaTest = 0.5; field.mat.size = 0.18;
+    field.mat.opacity = 1; field.mat.needsUpdate = true;
+  }
+  function setParticleGlow() {           // 照片球：加色混合、暖色发光点（视频里的光球）
+    field.expand = 0;                  // 进入照片球：从零开始按 ω²·R 建立离心膨胀
+    field.mat.blending = THREE.AdditiveBlending;
+    field.mat.transparent = true; field.mat.depthWrite = false;
+    field.mat.alphaTest = 0; field.mat.size = 0.14;
+    field.mat.opacity = 1; field.mat.needsUpdate = true;
+  }
+
+  /* ---------- 💗 炸散成「发光粒子球 + 球面照片」（同参考视频） ---------- */
+  let burstGen = 0;                 // 连续添加/重复炸球时作废旧一波的延迟补间
+  function burstIntoPhotos() {
+    const myGen = ++burstGen;
+    photoGroup.visible = true;
+    photoGroup.quaternion.identity();
+    // 全向旋转状态复位：朝向归零、清角速度惯性/驱动/甩动、清离心膨胀、清手掌基准，避免入场突变
+    partQ.identity(); photoQ.identity();
+    partHandW.set(0, 0, 0); photoHandW.set(0, 0, 0);
+    driveW.set(0, 0, 0); flingW.set(0, 0, 0);
+    field.expand = 0;
+    baseRoll = null; handWasPresent = false; prevRoll = null; sRollX = sRollY = null;
+    resetTipTrack();                       // 清指尖速度轨迹状态，避免入场突变
+    zoomIdx = -1; zoomStage = 'gallery'; hasZoomed = false;
+    pinchCooldownUntil = 0;                       // 重新炸球：清掉上一场的调取冷却
+
+    // ★ 每次都重新随机排布球面照片（每张位置都变），但构图恒为同一个球
+    layoutPhotoSphere();
+
+    photos.forEach(p => {
+      if (p.parent !== photoGroup) photoGroup.attach(p);
+      // 从球心附近的随机点炸出（每次起点都不同）
+      p.position.set((Math.random() - .5) * 1.4, (Math.random() - .5) * 1.4, (Math.random() - .5) * 1.4);
+      p.quaternion.copy(p.userData.base.quat);
+      p.scale.setScalar(0.001);
+      p.material.opacity = 0;
+      p.userData.fading = false;
+      p.updateWorldMatrix(true, false);
+      if (p.userData.glow) p.userData.glow.visible = false;
+    });
+    tweens.length = 0;
+
+    // ★ 发光粒子球：球面随机点云（每次落点全不同）+ 随机爆炸初速度，橙金色暖光
+    const R = CONFIG.SPHERE_R;
+    const N = Math.min(CONFIG.MAX_PARTICLES, 16000);
+    const targets = [];
+    for (let i = 0; i < N; i++) {
+      const u = Math.random() * 2 - 1, th = Math.random() * Math.PI * 2;
+      const rr = Math.sqrt(Math.max(0, 1 - u * u));
+      const rad = R * (0.84 + Math.random() * 0.32);   // 壳层厚度 → 有体积感
+      const w = 0.55 + Math.random() * 0.45;           // 亮度随机
+      targets.push({
+        x: Math.cos(th) * rr * rad, y: u * rad, z: Math.sin(th) * rr * rad,
+        r: 1.0 * w, g: (0.52 + Math.random() * 0.36) * w, b: (0.08 + Math.random() * 0.20) * w
+      });
+    }
+    setParticleGlow();
+    field.jitter = false;                 // 球稳定、不自发乱晃（仅随球整体旋转）
+    field.points.quaternion.identity();
+    field.setTargets(targets, { explode: true, burst: 14, scatter: 0.55 });
+
+    // 照片逐张从球心随机点飞向各自的球面随机位置并淡入；
+    // generation 令牌让旧一波的延迟补间在重新构建后直接作废，避免覆盖新构图。
+    setTimeout(() => {
+      if (myGen !== burstGen) return;
+      photos.forEach((p, k) => {
+        setTimeout(() => {
+          if (myGen !== burstGen || !p.parent) return;
+          tweenTo(p, p.userData.base.pos.clone(), p.userData.base.quat.clone(),
+            p.userData.base.scale.clone(), 1.6);   // 回到各自的随机尺寸
+          p.userData.fading = true;
+        }, k * 45);
+      });
+    }, 180);
+  }
+
+  function hidePhotos() {
+    tweens.length = 0;
+    for (let i = 0; i < photos.length; i++) {
+      const p = photos[i];
+      if (p.parent !== photoGroup) photoGroup.attach(p);
+      p.material.opacity = 0;
+      p.scale.setScalar(0.001);
+      p.userData.fading = false;
+      if (p.userData.glow) p.userData.glow.visible = false;
+    }
+    setParticleSolid();                 // 离开照片球后恢复"实心 3D"粒子材质
+    photoGroup.visible = false;
+    zoomIdx = -1; zoomStage = 'gallery'; hasZoomed = false;
+    pinchCooldownUntil = 0;                       // 离开照片球：清冷却，下次入场不残留
+    photoGroup.quaternion.identity();
+    field.points.quaternion.identity();
+    partQ.identity(); photoQ.identity();
+    partHandW.set(0, 0, 0); photoHandW.set(0, 0, 0);
+    driveW.set(0, 0, 0); flingW.set(0, 0, 0);
+    baseRoll = null; handWasPresent = false; prevRoll = null; sRollX = sRollY = null;
+    resetTipTrack();                       // 离开照片球：清指尖速度轨迹状态
+    field.expand = 0;
+  }
+
+  /* ==================================================================
+   * 6. 状态机
+   * ================================================================== */
+  let state = 'IDLE';      // IDLE | NUMBER | LOVE | HEART | PHOTO
+  let stateTime = 0;
+  let autoSplit = false;   // 💗 是否自动分裂成照片（I❤U 后握拳进入时 true；握拳返回的 💗 预览为稳定预览）
+  let shapeKind = null;    // 当前粒子形状
+  const setState = (s) => { state = s; stateTime = 0; updateGuide(); };
+
+  /* ==================================================================
+   * 6.1 动态动作指引（左上角面板）
+   *    随状态实时显示：当前动作 / 目标图案 / 下一步动作，并以一只
+   *    不断重复目标手势的动画手掌做演示（比静态图标更直观）。
+   * ================================================================== */
+  let guideReady = false;
+  const guideEl = {
+    hand:       document.getElementById('gHand'),
+    curLabel:   document.getElementById('gCurLabel'),
+    curTarget:  document.getElementById('gCurTarget'),
+    nextLabel:  document.getElementById('gNextLabel'),
+    nextTarget: document.getElementById('gNextTarget'),
+    steps:      Array.from(document.querySelectorAll('#guide .g-step')),
+  };
+
+  // 各手势对应的手掌姿态（每根手指绕指根关节的折叠角，单位度；
+  //   0=竖直伸直，正值=向掌心/小指侧折叠，负值=向拇指侧外展）
+  const POSES = {
+    five:    [0, 0, 0, 0, -40],     // ✋ 五指张开
+    fist:    [86, 88, 90, 92, 30],  // ✊ 握拳（四指横叠于掌心、拇指压上）
+    one:     [0, 86, 88, 92, 18],   // ☝️ 食指竖直、其余握拳
+    two:     [10, -10, 88, 92, 14], // ✌️ 食指+中指 V 形
+    three:   [7, 0, -7, 92, 12],    // 食+中+无名扇形伸出
+    pinch:   [-52, 0, 0, 0, 8],     // 👌 拇指食指捏合、其余三指伸直（调取照片）
+    neutral: [8, 5, 7, 12, -25],    // 自然放松
+  };
+  const FINGER_IDS = ['index', 'middle', 'ring', 'pinky', 'thumb'];
+  // 各手指指根(掌指关节)在 viewBox(120×170) 中的坐标，手指绕此点旋转
+  const PIVOTS = { index: [52, 90], middle: [63, 87], ring: [74, 90], pinky: [84, 96], thumb: [40, 116] };
+
+  // ★ 拟物人手：皮肤渐变 + 圆润手掌 + 五根可独立弯曲的手指（带关节/高光），
+  //   取代原先的"矩形条"，更接近真实手势（☝️✌️✊ 等）。手指绕指根关节旋转，
+  //   由 handLoop 循环演示"伸到目标姿态→保持→放松→停顿"。
+  const HAND_SVG =
+    '<svg viewBox="0 0 120 170" xmlns="http://www.w3.org/2000/svg">' +
+      '<defs>' +
+        '<linearGradient id="sk" x1="0" y1="0" x2="0" y2="1">' +
+          '<stop offset="0" stop-color="#ffe7d3"/><stop offset="1" stop-color="#f2c09e"/>' +
+        '</linearGradient>' +
+        '<linearGradient id="skf" x1="0" y1="0" x2="0" y2="1">' +
+          '<stop offset="0" stop-color="#fff1e4"/><stop offset="1" stop-color="#f6c8ab"/>' +
+        '</linearGradient>' +
+        '<radialGradient id="sh" cx="0.36" cy="0.26" r="0.78">' +
+          '<stop offset="0" stop-color="rgba(255,255,255,.7)"/>' +
+          '<stop offset="1" stop-color="rgba(255,255,255,0)"/>' +
+        '</radialGradient>' +
+      '</defs>' +
+      // 手掌主体 + 拇指球（皮肤渐变）
+      '<path class="palm" fill="url(#sk)" d="M44 168 Q39 150 42 138 L33 104 Q31 90 45 86 Q53 79 63 79 Q74 79 85 86 L91 104 Q93 118 86 138 L82 168 Q82 170 75 170 L49 170 Q44 170 44 168 Z"/>' +
+      '<path class="palm" fill="url(#sk)" d="M45 140 Q29 136 29 117 Q29 103 43 103 Q53 106 53 123 Q53 136 45 140 Z"/>' +
+      // 指根关节（让手指与手掌过渡自然、无缝）
+      '<g fill="#eab892">' +
+        '<circle cx="52" cy="90" r="8.6"/><circle cx="63" cy="87" r="8.6"/>' +
+        '<circle cx="74" cy="90" r="8"/><circle cx="84" cy="96" r="7"/>' +
+      '</g>' +
+      // 拇指（绕指根旋转）
+      '<g id="f-thumb" transform="rotate(-42 40 116)"><path class="finger" fill="url(#skf)" d="M33 116 L33 85 A7 7 0 0 1 47 85 L47 116 Z"/><ellipse cx="40" cy="95" rx="3" ry="12" fill="url(#sh)"/></g>' +
+      // 四指（绕各自指根旋转，顶端圆头、带高光）
+      '<g id="f-index" transform="rotate(0 52 90)"><path class="finger" fill="url(#skf)" d="M45.5 90 L45.5 38.5 A6.5 6.5 0 0 1 58.5 38.5 L58.5 90 Z"/><ellipse cx="52" cy="58" rx="2.9" ry="18" fill="url(#sh)"/></g>' +
+      '<g id="f-middle" transform="rotate(0 63 87)"><path class="finger" fill="url(#skf)" d="M56.5 87 L56.5 31.5 A6.5 6.5 0 0 1 69.5 31.5 L69.5 87 Z"/><ellipse cx="63" cy="53" rx="2.9" ry="20" fill="url(#sh)"/></g>' +
+      '<g id="f-ring" transform="rotate(0 74 90)"><path class="finger" fill="url(#skf)" d="M68 90 L68 40 A6 6 0 0 1 80 40 L80 90 Z"/><ellipse cx="74" cy="59" rx="2.6" ry="18" fill="url(#sh)"/></g>' +
+      '<g id="f-pinky" transform="rotate(0 84 96)"><path class="finger" fill="url(#skf)" d="M78.5 96 L78.5 55.5 A5.5 5.5 0 0 1 89.5 55.5 L89.5 96 Z"/><ellipse cx="84" cy="71" rx="2.4" ry="15" fill="url(#sh)"/></g>' +
+    '</svg>';
+
+  let handGroups = null, handCur = POSES.neutral.slice(), handTarget = POSES.neutral.slice();
+  let handPhase = 'pause', handT = 0;
+  const gLerp = (a, b, t) => a + (b - a) * t;
+  function initHandDemo() {
+    guideEl.hand.innerHTML = HAND_SVG;
+    handGroups = FINGER_IDS.map(id => guideEl.hand.querySelector('#f-' + id));
+    applyHand();
+    requestAnimationFrame(handLoop);
+  }
+  function setHandPose(name) {
+    handTarget = (POSES[name] || POSES.neutral).slice();
+    handPhase = 'reach'; handT = 0;
+  }
+  function applyHand() {
+    for (let i = 0; i < FINGER_IDS.length; i++) {
+      const p = PIVOTS[FINGER_IDS[i]];
+      handGroups[i].setAttribute('transform', 'rotate(' + handCur[i].toFixed(1) + ' ' + p[0] + ' ' + p[1] + ')');
+    }
+  }
+  // 各手指缓动速度（食指/中指快、拇指慢），配合 reach 阶段错峰，
+  // 让"收拳/伸指"像真手一样依次进行，而非五指同步僵硬切换。
+  const FSPD = [0.30, 0.33, 0.27, 0.24, 0.20];
+  function handLoop() {                 // 循环演示：伸到目标姿态→保持→放松→停顿→重复
+    handT += 1 / 60;
+    if (handPhase === 'reach') {
+      for (let i = 0; i < 5; i++) {
+        if (handT > i * 0.05) handCur[i] = gLerp(handCur[i], handTarget[i], FSPD[i]);
+      }
+      if (handT > 0.5) { handPhase = 'hold'; handT = 0; }
+    } else if (handPhase === 'hold') {
+      if (handT > 0.8) { handPhase = 'relax'; handT = 0; }
+    } else if (handPhase === 'relax') {
+      for (let i = 0; i < 5; i++) handCur[i] = gLerp(handCur[i], POSES.neutral[i], 0.16);
+      if (handT > 0.45) { handPhase = 'pause'; handT = 0; }
+    } else {                            // pause
+      if (handT > 0.4) { handPhase = 'reach'; handT = 0; }
+    }
+    applyHand();
+    requestAnimationFrame(handLoop);
+  }
+
+  function guideContent() {
+    // 主线动作顺序：1 → 2 → 3 → I❤U → 💗 → 照片（共 6 步，见面板底部进度条）
+    switch (state) {
+      case 'NUMBER': {
+        const map = { '1': 'one', '2': 'two', '3': 'three' };
+        const k = shapeKind || '1';
+        if (k === '1') return { pose: 'one',   curLabel: '比出数字 1', curTarget: '1',
+                                nextLabel: '比出数字 2', nextTarget: '2', step: 0 };
+        if (k === '2') return { pose: 'two',   curLabel: '比出数字 2', curTarget: '2',
+                                nextLabel: '比出数字 3', nextTarget: '3', step: 1 };
+        return                { pose: 'three', curLabel: '比出数字 3', curTarget: '3',
+                                nextLabel: '五指张开', nextTarget: 'I ❤ U', step: 2 };
+      }
+      case 'LOVE':   // I❤U 已出现（第 4 步完成），下一步握拳炸出 💗（第 5 步）
+        return { pose: 'fist', curLabel: '握拳', curTarget: '💗',
+                 nextLabel: '再握拳', nextTarget: '照片', step: 4 };
+      case 'HEART':  // 💗 已出现（第 5 步完成），下一步再握拳展开照片（第 6 步）
+        return { pose: 'fist', curLabel: '再握拳', curTarget: '照片',
+                 nextLabel: '✋转球 · 👌调取', nextTarget: '📷', step: 5 };
+      case 'PHOTO':  // 已到发光照片球（第 6 步）：整只手倾斜/转手腕 = 全向旋转
+        return { pose: 'neutral', curLabel: '✋手掌倾斜 · 转手腕', curTarget: '↻ 360°',
+                 nextLabel: '👌轻捏调取 · 握拳退出', nextTarget: '📷', step: 5 };
+      default: // IDLE：从第一步"比出数字 1"开始
+        return { pose: 'one', curLabel: '比出数字 1', curTarget: '1',
+                 nextLabel: '比出数字 2', nextTarget: '2', step: 0 };
+    }
+  }
+  function updateGuide() {
+    if (!guideReady) return;
+    const c = guideContent();
+    guideEl.curLabel.textContent = c.curLabel;
+    guideEl.curTarget.textContent = c.curTarget;
+    guideEl.nextLabel.textContent = c.nextLabel;
+    guideEl.nextTarget.textContent = c.nextTarget;
+    setHandPose(c.pose);
+    guideEl.steps.forEach(el => {
+      const i = +el.dataset.i;
+      el.classList.toggle('active', i === c.step);
+      el.classList.toggle('done', i < c.step);
+    });
+    // I❤U / 💗 阶段：手旁浮现脉动爱心，强化语义
+    guideEl.hand.classList.toggle('beat', state === 'LOVE' || state === 'HEART');
+  }
+
+  function refreshShape() {               // 重新排版当前形状（resize 时）
+    if (state === 'PHOTO') { layoutPhotos(); return; }
+    if (!shapeKind) { showDust(); return; }
+    field.mat.opacity = 1;
+    field.setTargets(buildShapeTargets(shapeKind));
+  }
+
+  function showShape(kind, burst = true) {
+    shapeKind = kind;
+    field.jitter = false;          // 成型图案：关闭呼吸，锁定稳定
+    field.points.rotation.y = 0;   // 新图案正对屏幕起步，随后由手掌旋转驱动
+    shapeTargetRotY = 0; baseRoll = null; handWasPresent = false;
+    setParticleSolid();
+    field.mat.opacity = 1;
+    field.setTargets(buildShapeTargets(kind), { explode: burst, burst: 16, scatter: 0.4 });
+  }
+
+  function showDust() {
+    shapeKind = null;
+    field.jitter = true;           // 待机星尘：允许轻微呼吸
+    setParticleSolid();
+    field.mat.opacity = 1;
+    field.setTargets(buildDustTargets(), { explode: false });
+  }
+
+  function resetAll() {                   // 握拳：清空一切回到待机
+    hidePhotos();
+    balloonGroup.visible = flowerGroup.visible = false;
+    zoomIdx = -1; zoomStage = 'gallery'; hasZoomed = false;
+    setState('IDLE');
+    showDust();
+  }
+
+  async function enterPhotoMode() {
+    if (!photosBuilt) await buildPhotos(CONFIG.PHOTOS);
+    hidePhotos();
+    balloonGroup.visible = flowerGroup.visible = false;
+    commitLockUntil = 0;               // 清提交锁：💗 出现后"再握拳"能立即被识别（不卡 0.45s）
+    setState('HEART');                 // 粒子 💗 瞬间炸出；随后由"再握拳"触发分裂成照片
+    showShape('heart', true);
+  }
+
+  // ★ 触发 💗→照片球：在 "I ❤ U" 出现之后握拳（取代原先的"拇指食指捏合比心"手势）。
+  //   键盘演示的 H 键也复用此入口，作为直达照片球的快捷方式。
+  //   fromFist=false（H 键）：自动分裂；fromFist=true（手势握拳）：💗 出现后需"再握拳"才展开照片球。
+  function triggerPhotoWall(fromFist = false) {
+    if (state === 'HEART') return;          // 已在 💗，等待"再握拳"进入照片球，避免重复触发
+    autoSplit = !fromFist;                   // 手势握拳进入 → 暂不自动分裂，等第二次握拳
+    enterPhotoMode();
+  }
+
+  /* ---------- 手势事件处理 ---------- */
+  function onGesture(g) {
+    // g: 'fist' | 'five' | 'one' | 'two' | 'three' | 'none'
+    // ★ 💗(HEART) 阶段：只接受"再握拳"作为进入照片球的明确下一步；
+    //   其余手势（折叠途中误读的 数字/五指 等）一律忽略，避免误跳（3↔💗 来回跳的根因）。
+    if (state === 'HEART') {
+      if (g === 'fist') { burstIntoPhotos(); setState('PHOTO'); }   // 再握拳 → 展开照片球
+      return;
+    }
+    if (state === 'PHOTO') {
+      if (g === 'fist') {
+        if (zoomStage === 'zoomed') { releaseZoom(); }   // 放大中 → 照片缩回球面
+        else { resetAll(); }                              // 否则退出照片球回待机（单向，杜绝死循环）
+        return;
+      }
+      // ★ 与参考视频一致：👌 轻捏 → 从球里调出正对你的那张照片，放大到屏幕中央
+      //   （白边+橙色辉光）；明确再做一次 → 缩回球面。
+      //   照片球旋转由整只手的「掌心轨迹球」连续驱动（见 updateRotation），与离散
+      //   手势完全解耦：调取只在明确的 👌 边沿触发，转球不会误放大、误跳转。
+      if (g === 'pinch') {
+        const now = performance.now();
+        if (now < pinchCooldownUntil) return;          // 冷却期内忽略：一次捏合只调取一次，杜绝连触
+        pinchCooldownUntil = now + CONFIG.GEST.PINCH_COOLDOWN * 1000;
+        if (zoomStage === 'zoomed') releaseZoom(); else startZoom(frontPhotoIndex());
+        return;
+      }
+      // 张开手掌 = 视频里"托着球旋转"的状态：若正放大则让照片回球，球继续跟手转
+      if (g === 'five') { if (zoomStage === 'zoomed') releaseZoom(); return; }
+      return;   // 其余（含数字 2/3）一律忽略 → 照片球稳定，不来回跳变
+    }
+
+    // ★ 出现 "I ❤ U" 之后握拳 → 💗 炸出（随后"再握拳"进入照片球）
+    if (state === 'LOVE' && g === 'fist') { triggerPhotoWall(true); return; }
+
+    if (g === 'fist') { resetAll(); return; }             // 其余状态握拳 = 清空回待机
+
+    if (g === 'five') {
+      if (state !== 'LOVE') {
+        hidePhotos();
+        shapeKind = null;
+        field.mat.opacity = 1;
+        field.setTargets(buildShapeTargets('love'), { explode: true, burst: 18, scatter: 0.4 });
+        shapeKind = 'love';
+        resetFloaters();
+        balloonGroup.visible = flowerGroup.visible = true;
+        setState('LOVE');
+      }
+      return;
+    }
+    if (g === 'one' || g === 'two' || g === 'three') {
+      const kind = g === 'one' ? '1' : g === 'two' ? '2' : '3';
+      hidePhotos();
+      balloonGroup.visible = flowerGroup.visible = false;
+      if (shapeKind !== kind) showShape(kind, true);
+      setState('NUMBER');
+      return;
+    }
+  }
+
+  /* ==================================================================
+   * 7. MediaPipe 手势识别
+   * ================================================================== */
+  // ── 摄像头「手势追踪」小窗：canvas 回显摄像头帧 + MediaPipe 21 点骨架 ──────
+  const camCanvas = document.getElementById('cam');
+  const camCtx = camCanvas.getContext('2d');
+  const camWrap = document.getElementById('camWrap');
+  // 离屏 canvas：把摄像头帧画上去后再喂给 MediaPipe（见 startPump）。
+  // 直接喂 ImageBitmap 在多数浏览器下会静默检测不出手，canvas 输入最可靠。
+  const mpCanvas = document.createElement('canvas');
+  const mpCtx = mpCanvas.getContext('2d');
+  const camResEl = document.getElementById('camRes');
+  const camTipEl = document.getElementById('camTip');
+  const camConfEl = document.getElementById('camConf');
+  // 标准 21 点骨架连接（掌根 + 五指）：把"自己的动作"画在实时画面上
+  const HAND_EDGES = [
+    [0,1],[1,2],[2,3],[3,4],
+    [0,5],[5,6],[6,7],[7,8],
+    [5,9],[9,10],[10,11],[11,12],
+    [9,13],[13,14],[14,15],[15,16],
+    [13,17],[17,18],[18,19],[19,20],[0,17]
+  ];
+  function drawSkeleton(lm, fw, fh) {
+    camCtx.lineWidth = Math.max(1.6, fw / 260);
+    camCtx.lineJoin = 'round'; camCtx.lineCap = 'round';
+    camCtx.strokeStyle = 'rgba(120, 235, 255, .88)';
+    camCtx.shadowColor = 'rgba(80, 220, 255, .95)'; camCtx.shadowBlur = Math.max(3, fw / 90);
+    for (const [a, b] of HAND_EDGES) {
+      camCtx.beginPath();
+      camCtx.moveTo(lm[a].x * fw, lm[a].y * fh);
+      camCtx.lineTo(lm[b].x * fw, lm[b].y * fh);
+      camCtx.stroke();
+    }
+    camCtx.shadowBlur = 0;
+    const TIPS = [4, 8, 12, 16, 20];
+    for (let i = 0; i < lm.length; i++) {
+      const tip = TIPS.indexOf(i) >= 0;
+      camCtx.beginPath();
+      camCtx.arc(lm[i].x * fw, lm[i].y * fh, tip ? fw / 105 : fw / 165, 0, Math.PI * 2);
+      camCtx.fillStyle = tip ? '#ffb0c8' : '#eaffff';
+      camCtx.fill();
+    }
+    // ★ 掌心轨迹球指示：手掌中心拖尾 + 中立位十字（回正点）+ 偏转方向箭头 + 中心高亮环
+    //   镜像变换在调用方，坐标与骨架一致；箭头方向/长度来自姿态偏转 + 实时速度。
+    const hx = (tipTrail.length ? tipTrail[tipTrail.length - 1].x : 0) * fw;
+    const hy = (tipTrail.length ? tipTrail[tipTrail.length - 1].y : 0) * fh;
+    if (neutralCX !== null) {
+      // 中立位：手回到这个十字附近就停止旋转
+      const nx = neutralCX * fw, ny = neutralCY * fh, r = fw / 80;
+      camCtx.strokeStyle = 'rgba(150, 255, 210, .60)';
+      camCtx.lineWidth = Math.max(1.2, fw / 360);
+      camCtx.beginPath();
+      camCtx.moveTo(nx - r, ny); camCtx.lineTo(nx + r, ny);
+      camCtx.moveTo(nx, ny - r); camCtx.lineTo(nx, ny + r);
+      camCtx.stroke();
+      camCtx.beginPath(); camCtx.arc(nx, ny, fw / 105, 0, Math.PI * 2); camCtx.stroke();
+    }
+    if (tipTrail.length > 1) {
+      camCtx.lineCap = 'round'; camCtx.lineJoin = 'round';
+      camCtx.shadowColor = 'rgba(255, 150, 90, .9)'; camCtx.shadowBlur = Math.max(3, fw / 80);
+      camCtx.lineWidth = Math.max(1.4, fw / 320);
+      for (let i = 1; i < tipTrail.length; i++) {
+        const a = i / tipTrail.length;
+        camCtx.strokeStyle = 'rgba(255,' + Math.round(150 + 80 * a) + ',' +
+                             Math.round(80 + 60 * a) + ',' + (0.12 + 0.72 * a).toFixed(3) + ')';
+        camCtx.beginPath();
+        camCtx.moveTo(tipTrail[i - 1].x * fw, tipTrail[i - 1].y * fh);
+        camCtx.lineTo(tipTrail[i].x * fw, tipTrail[i].y * fh);
+        camCtx.stroke();
+      }
+      camCtx.shadowBlur = 0;
+      // 偏转方向箭头：从中立位指向当前手掌中心（长度随偏转/转速变化）
+      const vx = tipVelArrow.x, vy = tipVelArrow.y, vm = Math.hypot(vx, vy);
+      if (vm > 0.004) {
+        const L = Math.min(fw * 0.26, vm * fw * 1.6);
+        const ux = vx / vm, uy = vy / vm;
+        const ex = hx + ux * L, ey = hy + uy * L;
+        camCtx.strokeStyle = 'rgba(255, 236, 130, .95)';
+        camCtx.fillStyle   = 'rgba(255, 236, 130, .95)';
+        camCtx.lineWidth = Math.max(1.6, fw / 220);
+        camCtx.beginPath(); camCtx.moveTo(hx, hy); camCtx.lineTo(ex, ey); camCtx.stroke();
+        camCtx.beginPath();
+        camCtx.moveTo(ex, ey);
+        camCtx.lineTo(ex - ux * L * 0.30 - uy * L * 0.18, ey - uy * L * 0.30 + ux * L * 0.18);
+        camCtx.lineTo(ex - ux * L * 0.30 + uy * L * 0.18, ey - uy * L * 0.30 - ux * L * 0.18);
+        camCtx.closePath(); camCtx.fill();
+      }
+      camCtx.strokeStyle = 'rgba(255, 170, 90, .98)';
+      camCtx.lineWidth = Math.max(1.8, fw / 160);
+      camCtx.beginPath(); camCtx.arc(hx, hy, fw / 52, 0, Math.PI * 2); camCtx.stroke();
+    }
+  }
+  const GEST_LABEL = {
+    fist: '握拳 ✊', five: '五指张开 🖐', one: '数字 1 ☝️', two: '数字 2 ✌️',
+    three: '数字 3 🤟', pinch: '轻捏 👌', none: '动作不清晰'
+  };
+  let lastHudRes = '', lastHudTip = '', lastHudConf = -1;
+  function updateCamHud(info) {
+    if (!camResEl) return;
+    // 主循环每帧都会调用，只在值变化时写 DOM，避免无谓的重排/重绘
+    let res = info ? (GEST_LABEL[info.g] || '识别中…') : '未检测到手';
+    let tip = !info ? '把手放进画面'
+            : info.g === 'none' ? '伸直/收起要分明'
+            : (info.conf >= 0.6 ? '已锁定 · 保持' : '保持动作…');
+    // ★ 照片球内「掌心轨迹球」：显示控制状态与实时转速（不需要摆任何特定手势）
+    if (info && state === 'PHOTO' && info.g !== 'pinch' && info.g !== 'fist') {
+      const v = (Math.round(tipSpeedNow * 10) / 10).toFixed(1);
+      res = handRotActive ? '转球中 ✋' : '掌心待命 ✋';
+      tip = handRotActive ? ('倾斜/转动 · 速度 ' + v) : '手掌倾斜或转动手腕…';
+    }
+    const conf = info ? Math.round((info.conf || 0) * 100) : 0;
+    if (res !== lastHudRes)  { camResEl.textContent = res; lastHudRes = res; }
+    if (tip !== lastHudTip)  { camTipEl.textContent = tip; lastHudTip = tip; }
+    if (conf !== lastHudConf){ camConfEl.style.width = conf + '%'; lastHudConf = conf; }
+  }
+
+  let hands = null;                   // MediaPipe Hands 实例
+  let latest = null;                  // 最新一帧（已时序平滑）的 21 个 landmark
+  let handLostAt = 0;
+  let lmVersion = 0;                  // 真实 MediaPipe 帧号（供稳定判定去重）
+  // 关键点 EMA 平滑：跨帧指数加权平均，大幅降低 MediaPipe 抖动，
+  // 既提升分类精度，也避免因单帧抖动丢手势（= 更灵敏）。
+  let smoothLm = null;
+  const SMOOTH_ALPHA = CONFIG.GEST.SMOOTH_ALPHA;   // 越大越跟手，越小越稳（见 CONFIG.GEST）
+  function smoothLandmarks(raw) {
+    if (!smoothLm || smoothLm.length !== raw.length) {
+      smoothLm = raw.map(p => ({ x: p.x, y: p.y, z: p.z }));
+      return smoothLm;
+    }
+    for (let i = 0; i < raw.length; i++) {
+      smoothLm[i].x += (raw[i].x - smoothLm[i].x) * SMOOTH_ALPHA;
+      smoothLm[i].y += (raw[i].y - smoothLm[i].y) * SMOOTH_ALPHA;
+      smoothLm[i].z += (raw[i].z - smoothLm[i].z) * SMOOTH_ALPHA;
+    }
+    return smoothLm;
+  }
+
+  // 摄像头采集（不创建任何 <video> 元素，避免被宿主浮层化）
+  let camStream = null, imgCap = null, hiddenVideo = null;
+  let pumping = false, camCanvasVisible = true;   // 追踪小窗默认常驻显示
+
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y, (a.z - b.z) * 0.6);
+
+  // ── 手势识别的跨帧状态与工具：三证据融合 + 迟滞 ──────────────────────────
+  const FINGER_DEFS = [
+    { mcp: 5,  pip: 6,  tip: 8  },   // 食指
+    { mcp: 9,  pip: 10, tip: 12 },   // 中指
+    { mcp: 13, pip: 14, tip: 16 },   // 无名指
+    { mcp: 17, pip: 18, tip: 20 },   // 小指
+  ];
+  let fingerUp = [false, false, false, false];   // 迟滞状态：阈值带内保持上一帧
+  const PALM_ROOTS = [5, 9, 13, 17];   // 掌根 4 点：拟合手掌横轴(PCA)与手掌中心
+  const clamp01 = (x) => x < 0 ? 0 : x > 1 ? 1 : x;
+  const norm01  = (x, a, b) => clamp01((x - a) / (b - a));
+
+  function analyze(lm) {
+    const G = CONFIG.GEST;
+    const palm = Math.max(1e-4, dist(lm[0], lm[9]));   // 掌长：所有指标的归一化基准
+    // 手掌朝外的方向（腕 → 中指根），用它投影指尖位移：手掌倾斜/侧对镜头时
+    // 仍能可靠量出"手指有没有朝外伸直"，不受投影缩短影响。
+    const px = lm[9].x - lm[0].x, py = lm[9].y - lm[0].y, pz = lm[9].z - lm[0].z;
+    const plen = Math.max(1e-4, Math.hypot(px, py, pz));
+    const ux = px / plen, uy = py / plen, uz = pz / plen;
+
+    // 每根手指的伸直得分 ∈ [0,1]：三个互补证据加权融合
+    const straight = FINGER_DEFS.map(f => {
+      const ratio = dist(lm[f.mcp], lm[f.tip]) /
+                    Math.max(1e-4, dist(lm[f.mcp], lm[f.pip]) + dist(lm[f.pip], lm[f.tip]));
+      const vx = lm[f.tip].x - lm[f.mcp].x,
+            vy = lm[f.tip].y - lm[f.mcp].y,
+            vz = lm[f.tip].z - lm[f.mcp].z;
+      const along = (vx * ux + vy * uy + vz * uz) / palm;   // 沿掌方向的伸展
+      const reach = dist(lm[0], lm[f.tip]) / palm;          // 指尖离腕远近
+      const W = G.STRAIGHT_W;
+      return W[0] * norm01(ratio, G.RATIO_RANGE[0], G.RATIO_RANGE[1]) +
+             W[1] * norm01(along, G.ALONG_RANGE[0], G.ALONG_RANGE[1]) +
+             W[2] * norm01(reach, G.REACH_RANGE[0], G.REACH_RANGE[1]);
+    });
+
+    // 迟滞：进入需 ≥ ON，退出需 ≤ OFF，中间保持上一帧状态 → 消除阈值附近横跳
+    for (let i = 0; i < 4; i++) {
+      if (!fingerUp[i] && straight[i] >= G.FINGER_ON) fingerUp[i] = true;
+      else if (fingerUp[i] && straight[i] <= G.FINGER_OFF) fingerUp[i] = false;
+    }
+    const up = fingerUp.reduce((n, v) => n + (v ? 1 : 0), 0);
+    // ★ 竖起食指判定：仅保留作"排除捏合误判"用（拇指食指可能靠得很近），
+    //   不再作为旋转开关 —— 照片球改为整只手的「掌心轨迹球」驱动。
+    const idxUp = (up === 1 && fingerUp[0]);
+    const tipX = lm[8].x, tipY = lm[8].y;
+
+    // 分类边际：每根手指离"翻转阈值"的最小距离。清晰动作里伸指远高于 OFF、
+    // 收指远低于 ON → margin 大；半屈/松手过渡里得分全挤在迟滞带内 → margin 小。
+    let margin = 1;
+    for (let i = 0; i < 4; i++) {
+      const d = fingerUp[i] ? straight[i] - G.FINGER_OFF : G.FINGER_ON - straight[i];
+      if (d < margin) margin = d;
+    }
+    const conf = clamp01(margin / G.CONF_FULL);
+    const spread = dist(lm[8], lm[20]) / palm;             // 手掌张开度
+
+    // 👌 轻捏调取：只在发光照片球内识别。拇指食指靠近 + 四指平均伸直得分
+    // 排除真握拳 + 排除五指全张；不要求三指笔直，微弯的 OK 也能放行。
+    const pinchDist = dist(lm[4], lm[8]) / palm;
+    const avgStraight = (straight[0] + straight[1] + straight[2] + straight[3]) * 0.25;
+    // 竖起食指绝不判成捏合 → 不会误调取/误放大照片（不能误触）。
+    const isPinch = state === 'PHOTO' && !idxUp &&
+                    pinchDist < G.PINCH_DIST &&
+                    avgStraight > G.PINCH_MIN_STRAIGHT &&
+                    up <= G.PINCH_MAX_UP;
+
+    let g = 'none';
+    if (isPinch) g = 'pinch';                             // 👌 调取照片（仅 PHOTO）
+    else if (margin < G.MIN_MARGIN) g = 'none';           // 动作不清晰：不累积、不触发
+    else if (up === 0) g = 'fist';
+    else if (up === 4) g = 'five';
+    else if (up === 1) g = 'one';
+    else if (up === 2) g = 'two';
+    else g = 'three';
+
+    // 掌根 4 点质心 → 稳健的手掌中心（不含腕点，减少手远近缩放/手指开合的漂移）
+    const cx = (lm[5].x + lm[9].x + lm[13].x + lm[17].x) * 0.25;
+    const cy = (lm[5].y + lm[9].y + lm[13].y + lm[17].y) * 0.25;
+    // ★ 手掌朝向：4 个掌根点最小二乘拟合成一条直线（2D PCA 主方向）。
+    //   比只用 lm17-lm5 两点更抗单点噪声（不会把短基线的噪声等权放大），
+    //   手腕转动角度更平滑、更精确。主方向只有 180° 周期，再用有向横轴
+    //   lm5→lm17 消歧，恢复完整 360° 有向性（无死角、翻转不跳变）。
+    let sxx = 0, syy = 0, sxy = 0;
+    for (const i of PALM_ROOTS) {
+      const dx = lm[i].x - cx, dy = lm[i].y - cy;
+      sxx += dx * dx; syy += dy * dy; sxy += dx * dy;
+    }
+    let axis = 0.5 * Math.atan2(2 * sxy, sxx - syy);
+    const vx = lm[17].x - lm[5].x, vy = lm[17].y - lm[5].y;
+    if (vx * Math.cos(axis) + vy * Math.sin(axis) < 0) axis += Math.PI;
+    const roll = axis + Math.PI;                       // 与旧 atan2(-vy17,-vx17) 同号
+    return { g, roll, spread, count: up, straight, conf, margin, cx, cy, idxUp, tipX, tipY };
+  }
+
+  /* 手势稳定判定 + 握拳边沿触发（灵敏度见 CONFIG.GEST） */
+  let lastG = null, stable = 0, appliedG = 'none', fistLatch = false, fistRelease = 0;
+  let commitLockUntil = 0;             // 提交锁定到期时间（performance.now），期内忽略新手势
+  let lastVer = -2;                    // 已计入稳定判定的 MediaPipe 帧号（去重）
+  function pushGesture(info) {
+    const g = info.g;
+    // ★ 按真实 MediaPipe 帧计数：主循环 60fps、识别约 30fps，原来同一份 landmark
+    //   被重复计数两次，稳定帧时长随帧率漂移、过渡态极易"凑够"就误提交。
+    if (info.ver !== undefined && info.ver === lastVer && g !== 'none') return;
+    if (info.ver !== undefined) lastVer = info.ver;
+    // 照片球内：捏合用更短稳定帧（更易触发）；握拳退出反而要更久确认，
+    // 防止捏合/松手过渡里被误读成握拳，意外退出跳回待机。
+    const NEED = (state === 'PHOTO' && g === 'pinch') ? CONFIG.GEST.PINCH_STABLE
+               : (state === 'PHOTO' && g === 'fist')  ? CONFIG.GEST.FIST_EXIT_STABLE
+               : CONFIG.GEST.STABLE_FRAMES;
+    const now = performance.now();
+    if (g === lastG) stable++; else { stable = 1; lastG = g; }   // 首帧即计 1：NEED 帧名副其实
+
+    // 握拳锁存的复位也要"钝"一点：需连续若干帧非握拳才解锁，
+    // 避免握拳过程中夹杂一两帧过渡/抖动就把 resetAll 重复触发一遍。
+    if (g === 'fist') fistRelease = 0;
+    else if (++fistRelease > 3) fistLatch = false;
+
+    // 动作不清晰（半屈/过渡）或手离开：不累积、不触发
+    if (g === 'none') { handLostAt = now; return; }
+    if (stable < NEED) return;         // ★ 清晰动作必须连续保持 NEED 帧才提交
+    // ★ 置信度门控：动作不够清晰就不提交（半屈/过渡态一律不触发，防误触）。
+    //   pinch 是拇指食指相触、其余指自然微弯的姿态，评分偏低，单独豁免。
+    if (g !== 'pinch' && (info.conf ?? 1) < CONFIG.GEST.SWITCH_CONF) return;
+
+    if (g === 'fist') {
+      if (!fistLatch) {
+        fistLatch = true;
+        appliedG = 'none';             // 重置后允许再次触发同一手势
+        commitLockUntil = now + CONFIG.GEST.COMMIT_LOCK * 1000;  // 提交后短暂锁定，防来回跳
+        onGesture('fist');
+      }
+      return;
+    }
+    // 非握拳手势：只有"与当前已提交手势不同"且"已过提交锁定期"才切换，
+    // 这样触发后稳定不动，除非明确做出下一个不同动作（杜绝噪声来回跳变）。
+    if (g !== appliedG && now >= commitLockUntil) {
+      appliedG = g;
+      commitLockUntil = now + CONFIG.GEST.COMMIT_LOCK * 1000;
+      onGesture(g);
+    }
+  }
+
+  /* ==================================================================
+   * 旋转驱动
+   *   - 图案(数字/I❤U/💗)：沿用单轴 Y 增量 + 限幅，跟手但防误跳（历史行为不变）。
+   *   - 照片球：掌心轨迹球，不依赖任何特定手指姿势，直接用整只手的姿态：
+   *       手掌中心相对自适应中立位的偏转 → 持续角速度（上下 → 绕 X，左右 → 绕 Y），
+   *       手腕转动 roll 的偏转 → 绕 Z 环盘自转；偏转越大转得越快，保持倾斜可
+   *       无限累积过 360°（世界系四元数积分覆盖完整 SO(3)，正背面无死角）。
+   *       手腕转动角速度 + 手掌移动速度额外叠加"甩动加速" → 手快球快。
+   *       ★ 手回正/停住 → 死区后不驱动，走惯性阻尼余韵，照片比粒子慢一点点停。
+   *       ★ 少误触：👌 调取 / 握拳退出 / 手指全收起时屏蔽旋转；按真实 MediaPipe
+   *         帧号(ver)去重、真实帧间隔 dt 计速、姿态与速度双 EMA、双死区滤抖。
+   *   - 追踪窗高亮手掌中心 + 中立位十字 + 偏转方向箭头 + 拖尾轨迹。
+   * ================================================================== */
+  let shapeTargetRotY = 0, baseRoll = null, handWasPresent = false;   // 图案单轴旋转
+  let prevRoll = null;                                                  // 图案阶段手掌 roll 基准
+  let sRollX = null, sRollY = null;                                     // roll 的 sin/cos EMA（处理 ±π 回绕）
+  // ★ 掌心轨迹球：只在真实识别帧上计速，姿态与速度都做平滑
+  let tipSX = null, tipSY = null;      // 手掌中心 EMA（平滑后的姿态追踪点）
+  let tipVX = 0, tipVY = 0;            // 手掌中心移动速度 EMA（归一化坐标 / 秒）
+  let lastTipX = 0, lastTipY = 0;      // 上一真实帧的平滑手掌中心（用于差分）
+  let lastRotVer = -1;                 // 已计速的真实帧号 → 去重
+  let lastRotTime = 0;                 // 上一真实帧时间(ms) → 真实帧间隔
+  let handRotActive = false;           // 有偏转 / 有速度 → 有驱动角速度
+  let tipSpeedNow = 0;                 // 当前合成转速幅值（HUD / 方向箭头）
+  const tipTrail = [];                 // 追踪窗手掌中心拖尾（TRAIL_LEN 点）
+  const tipVelArrow = { x: 0, y: 0 };  // 追踪窗偏转方向箭头
+  // 手掌朝向 EMA 与自适应中立位（roll 用 sin/cos 平均，天然处理 ±π 回绕）
+  let rollSX = null, rollSY = null;
+  let lastPoseRoll = 0, rollVel = 0;   // 上一帧 roll / 手腕转动角速度 EMA (rad/s)
+  let neutralCX = null, neutralCY = null;   // 手掌中心中立位
+  let neutralRX = null, neutralRY = null;   // roll 中立位（sin/cos 单位向量）
+
+  // 照片球全向旋转状态
+  const AUTO_SPIN = new THREE.Vector3(0, CONFIG.SPHERE_SPIN, 0);       // 恒定缓慢自转
+  const partQ = new THREE.Quaternion();       // 发光粒子球朝向
+  const photoQ = new THREE.Quaternion();      // 照片球朝向（略滞后于粒子球）
+  const partHandW = new THREE.Vector3();      // 粒子球"手势角速度"（带惯性衰减）
+  const photoHandW = new THREE.Vector3();     // 照片球"手势角速度"（阻尼略小 → 晚一点停）
+  const driveW = new THREE.Vector3();         // 指尖速度 → 目标角速度（手快球快，硬上限 MAX_W）
+  const flingW = new THREE.Vector3();         // 键盘方向键(演示)的角速度冲量（独立衰减）
+  const _wP = new THREE.Vector3(), _wQ = new THREE.Vector3();
+  const _dq = new THREE.Quaternion(), _axis = new THREE.Vector3();
+
+  // 世界系角速度 w 积分到四元数：q ← axisAngle(w/|w|, |w|·dt) · q
+  function integrateQuat(q, w, dt) {
+    const len = w.length();
+    if (len < 1e-6) return;
+    _axis.copy(w).multiplyScalar(1 / len);
+    _dq.setFromAxisAngle(_axis, len * dt);
+    q.premultiply(_dq).normalize();
+  }
+
+  // 键盘方向键(演示) → 会衰减的角速度冲量（两球共用）
+  function injectHandMotion(dx, dy, dRoll) {
+    const P = CONFIG.PHYS;
+    flingW.add(_axis.set(dy, dx, dRoll).multiplyScalar(P.FLING_GAIN * CONFIG.ROT_DIR));
+    flingW.clampLength(0, P.MAX_W);
+  }
+
+  /* 清空掌心姿态轨迹状态：手离开 / 不在照片球 / 屏蔽手势时调用，
+     避免重新出现时因坐标或角度跳变产生假速度尖峰。 */
+  function resetTipTrack() {
+    tipSX = tipSY = null;
+    tipVX = tipVY = 0; tipSpeedNow = 0;
+    lastTipX = lastTipY = 0;
+    lastRotVer = -1; lastRotTime = 0;
+    tipTrail.length = 0;
+    tipVelArrow.x = tipVelArrow.y = 0;
+    rollSX = rollSY = null;
+    lastPoseRoll = 0; rollVel = 0;
+    neutralCX = neutralCY = null;
+    neutralRX = neutralRY = null;
+    driveW.set(0, 0, 0);
+    handRotActive = false;
+  }
+
+  function updateRotation(info, present) {
+    if (!present) {
+      baseRoll = null; handWasPresent = false; prevRoll = null;
+      sRollX = sRollY = null;
+      resetTipTrack();          // 手离开：清指尖轨迹，回手重新标定
+      return;
+    }
+
+    const inPhoto = (state === 'PHOTO' || photoGroup.visible);
+
+    // ── 图案阶段（数字 / I❤U / 💗）：手掌 roll 单轴跟手旋转，历史行为不变 ──
+    if (!inPhoto) {
+      handRotActive = false; driveW.set(0, 0, 0);
+      tipTrail.length = 0; tipSX = tipSY = null; tipVX = tipVY = 0; tipSpeedNow = 0;
+      const A = CONFIG.PHYS.ROT_SMOOTH;
+      if (sRollX === null) { sRollX = Math.cos(info.roll); sRollY = Math.sin(info.roll); }
+      else {
+        sRollX += (Math.cos(info.roll) - sRollX) * A;
+        sRollY += (Math.sin(info.roll) - sRollY) * A;
+      }
+      const roll = Math.atan2(sRollY, sRollX);
+      // 首帧只建立基准，不注入，避免入场瞬间突变
+      if (baseRoll === null || !handWasPresent) {
+        baseRoll = roll; handWasPresent = true; prevRoll = roll;
+        return;
+      }
+      let dRoll = roll - prevRoll;
+      dRoll = Math.atan2(Math.sin(dRoll), Math.cos(dRoll));   // 角度回绕安全
+      prevRoll = roll; baseRoll = roll;
+      const d = Math.max(-0.14, Math.min(0.14, dRoll));       // 限幅防误跳
+      shapeTargetRotY += CONFIG.ROT_DIR * d * CONFIG.SHAPE_ROT_GAIN;
+      return;
+    }
+
+    // ── 照片球：掌心轨迹球，不需要摆任何特定手指姿势 ──
+    //   👌 调取 / 握拳退出 / 手指全收起时屏蔽旋转：功能手势不会顺带把球带转。
+    const blocked = (info.g === 'pinch' || info.g === 'fist' || (info.count ?? 1) === 0);
+    if (blocked) { resetTipTrack(); return; }
+
+    const P = CONFIG.PHYS;
+    const now = performance.now();
+    // 真实 MediaPipe 帧去重：同一个 ver 只在第一帧计速，60fps 主循环不重复放大速度
+    if (info.ver === lastRotVer) return;
+
+    // 手掌中心 + 手掌朝向 EMA（roll 用 sin/cos 平均，天然处理 ±π 回绕）
+    const A = P.POSE_SMOOTH;
+    if (tipSX === null) { tipSX = info.cx; tipSY = info.cy; }
+    else {
+      tipSX += (info.cx - tipSX) * A;
+      tipSY += (info.cy - tipSY) * A;
+    }
+    if (rollSX === null) { rollSX = Math.cos(info.roll); rollSY = Math.sin(info.roll); }
+    else {
+      rollSX += (Math.cos(info.roll) - rollSX) * A;
+      rollSY += (Math.sin(info.roll) - rollSY) * A;
+    }
+    const poseRoll = Math.atan2(rollSY, rollSX);
+
+    // 拖尾（与骨架同一镜像坐标系）：画的是手掌中心，不是某根手指
+    tipTrail.push({ x: tipSX, y: tipSY });
+    if (tipTrail.length > P.TRAIL_LEN) tipTrail.shift();
+
+    // 首帧 / 手重新出现：只立中立基准，不注入
+    if (lastRotTime === 0) {
+      neutralCX = tipSX; neutralCY = tipSY;
+      neutralRX = rollSX; neutralRY = rollSY;
+      lastTipX = tipSX; lastTipY = tipSY; lastPoseRoll = poseRoll;
+      lastRotTime = now; lastRotVer = info.ver;
+      driveW.set(0, 0, 0); handRotActive = false; tipSpeedNow = 0;
+      tipVelArrow.x = tipVelArrow.y = 0;
+      return;
+    }
+    const dt = Math.max(P.DT_MIN, Math.min(P.DT_MAX, (now - lastRotTime) / 1000));
+    lastRotTime = now; lastRotVer = info.ver;
+
+    // 手腕转动角速度 + 手掌中心移动速度 → EMA 平滑（"跟转动方向和速度"）
+    let dRollFrame = poseRoll - lastPoseRoll;
+    dRollFrame = Math.atan2(Math.sin(dRollFrame), Math.cos(dRollFrame));
+    lastPoseRoll = poseRoll;
+    tipVX += ((tipSX - lastTipX) / dt - tipVX) * P.VEL_SMOOTH;
+    tipVY += ((tipSY - lastTipY) / dt - tipVY) * P.VEL_SMOOTH;
+    lastTipX = tipSX; lastTipY = tipSY;
+    rollVel += (dRollFrame / dt - rollVel) * P.VEL_SMOOTH;
+    const moveSpeed = Math.hypot(tipVX, tipVY);
+
+    // 相对自适应中立位的偏转（限幅防手出画时无限快）
+    const cl = (v, m) => Math.max(-m, Math.min(m, v));
+    const dx = cl(tipSX - neutralCX, P.TILT_MAX);
+    const dy = cl(tipSY - neutralCY, P.TILT_MAX);
+    let dRoll = poseRoll - Math.atan2(neutralRY, neutralRX);
+    dRoll = Math.atan2(Math.sin(dRoll), Math.cos(dRoll));   // 角度回绕安全
+    dRoll = cl(dRoll, P.ROLL_MAX);
+    const tiltMag = Math.hypot(dx, dy, dRoll * P.ROLL_WEIGHT);
+
+    // 中立位自适应：静止且回正时缓慢校准到当前姿态 → 任意自然姿势起手都不会误转；
+    // 主动偏转 / 有速度时基准保持不动 → 保持倾斜即可持续转到任意朝向。
+    if (tiltMag < P.DEAD_TILT && moveSpeed < P.DEAD_VEL && Math.abs(rollVel) < P.DEAD_VEL) {
+      const B = P.NEUTRAL_ALPHA;
+      neutralCX += (tipSX - neutralCX) * B;
+      neutralCY += (tipSY - neutralCY) * B;
+      neutralRX += (rollSX - neutralRX) * B;
+      neutralRY += (rollSY - neutralRY) * B;
+      const nl = Math.hypot(neutralRX, neutralRY) || 1;
+      neutralRX /= nl; neutralRY /= nl;
+    }
+
+    // 方向映射（MediaPipe 归一化坐标 y 向下为正）：
+    //   手往下偏 dy>0 → ωx>0（下旋转）；往右偏 dx>0 → ωy>0（右旋转）；
+    //   手腕转动 dRoll → ωz 环盘自转。速度项叠加"甩一下"的加速。
+    //   ★ 回正门控：偏转接近中立位时把速度项一并收掉，保证手回正就干净停稳；
+    //     有明显偏转（想转球）时速度项完整生效 → 手快球快、不误触。
+    const tiltGate = Math.min(1, tiltMag / (P.DEAD_TILT * 3));
+    const wx = dy * P.TILT_GAIN + tipVY * P.SPEED_GAIN * tiltGate;
+    const wy = dx * P.TILT_GAIN + tipVX * P.SPEED_GAIN * tiltGate;
+    const wz = dRoll * P.ROLL_GAIN + rollVel * P.ROLL_SPEED_GAIN * tiltGate;
+
+    const active = tiltMag >= P.DEAD_TILT;
+    if (!active) {
+      driveW.set(0, 0, 0);
+      tipVX = tipVY = 0; rollVel *= 0.6;
+      handRotActive = false; tipSpeedNow = 0;
+      tipVelArrow.x = tipVelArrow.y = 0;
+    } else {
+      driveW.set(wx, wy, wz)
+            .multiplyScalar(CONFIG.ROT_DIR).clampLength(0, P.MAX_W);
+      handRotActive = true;
+      tipSpeedNow = driveW.length();
+      tipVelArrow.x = dx + tipVX * 0.12;
+      tipVelArrow.y = dy + tipVY * 0.12;
+    }
+  }
+
+
+  /* ==================================================================
+   * 8. 主循环
+   * ================================================================== */
+  const clock = new THREE.Clock();
+
+  function tick() {
+    requestAnimationFrame(tick);
+    const dt = Math.min(clock.getDelta(), 0.05);
+    const t = clock.elapsedTime;
+    stateTime += dt;
+
+    // 手势检测由摄像头帧泵 startPump() 驱动（见 beginCamera 之后），此处不发送
+
+    // 手势 → 状态（latest 为 null 时也要推送 'none'，保证握拳边沿锁存能复位）
+    const info = latest ? analyze(latest) : { g: 'none', spread: 0, conf: 0, margin: 0 };
+    info.ver = latest ? lmVersion : -1;       // 真实帧号：供 pushGesture 去重计数
+    pushGesture(info);
+    updateCamHud(latest ? info : null);       // 摄像头追踪小窗：实时识别结果 + 置信度
+    if (latest) {
+      updateRotation(info, true);
+      // 旋转只由「整只手的姿态偏转 + 转动/移动速度」驱动；调取放大仅由 onGesture('pinch') 边沿触发
+    } else {
+      updateRotation(info, false);
+    }
+
+    // 💗 炸出后的去向：
+    //   键盘 H 直达（autoSplit=true）→ 0.95s 后自动分裂成照片球；
+    //   手势"再握拳"进入（autoSplit=false）→ 由 onGesture('fist') 立即展开；
+    //   安全兜底：💗 出现后若长时间保持张开手（未握拳），6s 后也自动展开，避免卡死。
+    if (state === 'HEART') {
+      if (autoSplit && stateTime > 0.95) {
+        autoSplit = false; burstIntoPhotos(); setState('PHOTO');
+      } else if (!autoSplit && stateTime > 6 && latest && analyze(latest).g !== 'fist') {
+        burstIntoPhotos(); setState('PHOTO');
+      }
+    }
+
+    // 发光照片球：全向 360° 旋转 + 惯性阻尼 + 离心力膨胀
+    if (state === 'PHOTO' && photoGroup.visible && photos.length) {
+      const P = CONFIG.PHYS;
+      // 真实识别帧断流（手停住 / 摄像头掉帧 / 手出画）超过阈值 → 视为手停，
+      // 走阻尼衰减，避免旧帧的角速度一直驱动、球永远停不下来。
+      if (handRotActive && performance.now() - lastRotTime > P.STALE_MS) handRotActive = false;
+      // 甩动冲量独立衰减（无论手在不在都生效，保证键盘/甩动惯性）
+      flingW.multiplyScalar(Math.exp(-P.FLING_DAMP * dt));
+      if (handRotActive) {
+        // 掌心轨迹球：角速度平滑逼近"姿态偏转对应的目标角速度" → 跟随延迟即惯性感。
+        // 保持倾斜就持续转，可累积过 360° 到任意朝向，不再只在局部来回转。
+        const k = 1 - Math.exp(-P.DRIVE_RESP * dt);
+        partHandW.lerp(driveW, k);
+        photoHandW.lerp(driveW, k * P.PHOTO_RESP);   // 照片球响应略慢 → 慢一点点
+      } else {
+        // 手指停/离开：角速度按 e^(-阻尼·t) 衰减 → 继续"往前"转一点再停（惯性余韵）
+        partHandW.multiplyScalar(Math.exp(-P.DAMP_PART * dt));
+        photoHandW.multiplyScalar(Math.exp(-P.DAMP_PHOTO * dt));
+      }
+      _wP.copy(AUTO_SPIN).add(partHandW).add(flingW);   // 实际角速度 = 自转 + 手势 + 甩动
+      _wQ.copy(AUTO_SPIN).add(photoHandW).add(flingW);
+      integrateQuat(partQ, _wP, dt);
+      integrateQuat(photoQ, _wQ, dt);
+      // clamp：照片朝向相对粒子朝向的角差不超过阈值，防止"慢太多"脱节
+      const lag = partQ.angleTo(photoQ);
+      if (lag > P.PHOTO_LAG_MAX) photoQ.slerp(partQ, (lag - P.PHOTO_LAG_MAX) / lag);
+      // 停稳后缓慢回齐：减速期仍保留"照片慢一点点停"的滞后，几乎静止时才把
+      // 朝向与角速度一起收敛到粒子球，消除长期固定角差（持续旋转后也能干净对齐）。
+      if (!handRotActive) {
+        const wNow = partHandW.length() + photoHandW.length() + flingW.length();
+        const g = Math.max(0, 1 - wNow / 1.6);      // 旋转/减速初期≈0(保留滞后)，静止≈1
+        // 先收拢角速度差（它是固定错位的根源），再清掉已积累的朝向角差
+        photoHandW.lerp(partHandW, 1 - Math.exp(-3.2 * dt * g));
+        const k = (1 - Math.exp(-3.2 * dt)) * g;
+        if (k > 0) photoQ.slerp(partQ, k);
+      }
+      photoGroup.quaternion.copy(photoQ);
+      field.points.quaternion.copy(partQ);     // 发光粒子球与照片球同步（各自全向）
+
+      // 离心力：F_c = m·ω²·r, a_c = ω²·r。膨胀 ∝ ω²·SPHERE_R(球半径) → 跟球半径有关；
+      //   CENTRI_MAX 限幅不过大；平滑跟随让建立/消退有过程。每个粒子的个体系数
+      //   在 ParticleField.update 里作用，使"粒子间距增大幅度各不相同"。
+      const w = partHandW.length() + flingW.length();
+      const targetExpand = Math.min(P.CENTRI_K * w * w * CONFIG.SPHERE_R, P.CENTRI_MAX);
+      field.expand += (targetExpand - field.expand) * Math.min(1, dt * P.CENTRI_SPEED);
+
+      const front = frontPhotoIndex();
+      photos.forEach((p, i) => {
+        if (i === zoomIdx) { p.material.color.setScalar(1); return; }
+        const b = (i === front && zoomIdx < 0) ? 1.0 : 0.78;   // 正对屏幕的那张更亮
+        p.material.color.setScalar(b);
+        if (p.userData.fading) p.material.opacity += (1 - p.material.opacity) * Math.min(1, dt * 4.5);
+      });
+    }
+
+    // 图案(数字/告白/爱心)：跟随手掌旋转，平滑插值（旋转手即可让立体字形自由转）
+    if (state === 'NUMBER' || state === 'LOVE' || state === 'HEART') {
+      let cur = field.points.rotation.y, d = shapeTargetRotY - cur;
+      d = Math.atan2(Math.sin(d), Math.cos(d));
+      field.points.rotation.y = cur + d * Math.min(1, dt * 6);
+    }
+
+    // ★ 粒子球在照片模式下常亮不淡出（参考视频里发光光球始终环绕照片），
+    //   只在离开照片球（hidePhotos → resetAll/showDust）时才恢复实心 3D 材质。
+
+    updateTweens(dt);
+
+    // 全向 billboard：照片局部四元数取照片球四元数的逆 → 世界朝向恒为单位(正对相机)。
+    // 球转到任意 3D 角度，每一张照片都清晰可辨，不露白框背面（放在补间之后避免被覆盖）。
+    if (state === 'PHOTO' && photoGroup.visible) {
+      invPhotoQ.copy(photoGroup.quaternion).invert();
+      photos.forEach((p, i) => {
+        if (i !== zoomIdx && p.parent === photoGroup) p.quaternion.copy(invPhotoQ);
+      });
+    }
+
+    field.update(dt, t);
+    updateFloaters(dt, t);
+    updateFireworks(dt, t);
+    if (state === 'IDLE') field.points.rotation.y += dt * 0.04;
+
+    renderer.render(scene, camera);
+  }
+
+  /* ==================================================================
+   * 9. 启动：点击授权摄像头 / 键盘演示兜底
+   *    说明：浏览器（尤其 CodePen 的 iframe）要求 getUserMedia 必须
+   *    在"用户手势"内调用，页面加载自动调用会被直接拒绝，因此改为
+   *    点击按钮触发；无摄像头环境（file://、被拒、无设备）可走键盘演示。
+   * ================================================================== */
+  const startEl = document.getElementById('start');
+  const camStartBtn = document.getElementById('camStart');
+  const demoStartBtn = document.getElementById('demoStart');
+  const startTip = document.getElementById('startTip');
+  let cameraReady = false, demoMode = false;
+
+  // 待机星尘 + 渲染循环（先跑起来，遮罩覆盖在上层）
+  showDust();
+  initHandDemo(); guideReady = true; updateGuide();   // 初始化左上角动态动作指引
+  tick();
+
+  const hideStart = () => startEl.classList.add('hide');
+
+  async function initMediaPipe() {
+    try {
+      await loadScript(CONFIG.MP_URL + 'hands.js');
+      const h = new window.Hands({ locateFile: (f) => CONFIG.MP_URL + f });
+      h.setOptions({
+        maxNumHands: 1, modelComplexity: 1,
+        minDetectionConfidence: 0.5, minTrackingConfidence: 0.5,
+        selfieMode: true
+      });
+      h.onResults((res) => {
+        const raw = (res.multiHandLandmarks && res.multiHandLandmarks[0]) || null;
+        if (raw) { latest = smoothLandmarks(raw); lmVersion++; handLostAt = performance.now(); }
+        else { latest = null; smoothLm = null; updateCamHud(null); }   // 手离开：清空平滑，避免回手时串味
+      });
+      // ★ Hands 实例创建 ≠ 模型就绪：未 initialize 就 send，第一帧的 Promise
+      //   可能永不 resolve；帧泵一旦 await 就会永久卡死（画面冻结、手势追踪失效）。
+      //   等 wasm 真正加载完再把实例交给帧泵。
+      if (typeof h.initialize === 'function') await h.initialize();
+      hands = h;
+    } catch (e) {
+      // 摄像头已可用但手势模型加载失败：退回键盘演示，避免用户卡在纯黑待机
+      demoMode = true;
+      setHint('手势模型加载失败，已切换为键盘演示：1/2/3 数字 · 4 告白 → F 握拳进发光照片球 · H 直达 · 空格/P 调取放大照片 · ←→↑↓ 旋转 · R 重置', 8000);
+    }
+  }
+
+  async function beginCamera() {
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      startTip.textContent = '当前环境不支持摄像头（需 HTTPS 或 localhost，或改用键盘演示）';
+      return false;
+    }
+    try {
+      camStream = await navigator.mediaDevices.getUserMedia({
+        video: { width: 640, height: 480, facingMode: 'user' }, audio: false
+      });
+      const track = camStream.getVideoTracks()[0];
+      // 优先 ImageCapture：直接从轨道抓帧，页面里零 <video> 元素，
+      // 不会被 WorkBuddy/浏览器当作视频播放器套全屏浮层盖住粒子。
+      if (typeof ImageCapture !== 'undefined') {
+        try { imgCap = new ImageCapture(track); } catch (e) { imgCap = null; }
+      }
+      if (!imgCap) {
+        // 兜底：内存 video（不插入 DOM，同样避开浮层）
+        hiddenVideo = document.createElement('video');
+        hiddenVideo.muted = true; hiddenVideo.playsInline = true;
+        hiddenVideo.srcObject = camStream;
+        await hiddenVideo.play().catch(() => {});
+      }
+      startPump();
+      return true;
+    } catch (e) {
+      const n = e && e.name;
+      let msg = '摄像头启动失败：' + (n || e.message || e);
+      if (n === 'NotAllowedError' || n === 'SecurityError')
+        msg = '摄像头权限被拒绝 —— 请点击地址栏的摄像头图标允许后重试，或改用键盘演示';
+      else if (n === 'NotFoundError' || n === 'OverconstrainedError')
+        msg = '未检测到摄像头设备';
+      else if (n === 'NotReadableError')
+        msg = '摄像头被其他程序占用，请关闭后重试';
+      else if (n === 'AbortError')
+        msg = '摄像头初始化被中断，请重试';
+      startTip.textContent = msg;
+      return false;
+    }
+  }
+
+  // 帧泵：持续把摄像头帧喂给 MediaPipe，并回显到左下角追踪小窗（画面 + 骨架）
+  function startPump() {
+    if (pumping) return;
+    pumping = true;
+    let sendBusy = false;
+    const loop = async () => {
+      if (!pumping) return;
+      try {
+        let frame = null;
+        if (imgCap) { try { frame = await imgCap.grabFrame(); } catch (e) { frame = null; } }
+        else if (hiddenVideo && hiddenVideo.readyState >= 2) frame = hiddenVideo;
+        if (frame) {
+          if (camCanvasVisible) {
+            const fw = frame.width || frame.videoWidth || 320;
+            const fh = frame.height || frame.videoHeight || 240;
+            if (camCanvas.width !== fw) camCanvas.width = fw;
+            if (camCanvas.height !== fh) camCanvas.height = fh;
+            camCtx.clearRect(0, 0, fw, fh);
+            // 自拍镜像（与 MediaPipe selfieMode 的 landmark 坐标系一致），
+            // 骨架在同一变换内绘制才能与画面对齐；文字用 HTML 覆盖层，不会翻转。
+            camCtx.save();
+            camCtx.translate(fw, 0); camCtx.scale(-1, 1);
+            camCtx.drawImage(frame, 0, 0, fw, fh);
+            if (latest) drawSkeleton(latest, fw, fh);
+            camCtx.restore();
+          }
+          // ★ 抓帧/回显不依赖模型状态：模型加载中（或加载失败）画面也持续刷新。
+          //   send 绝不 await：MediaPipe 老版本 send() 的 Promise 可能永不 resolve
+          //   （wasm 未就绪/内部异常），await 会把整个帧泵永久锁死 → 画面冻结、
+          //   手势追踪零数据。改为串行「发后不理」+ 超时兜底放行下一帧。
+          if (hands && !sendBusy) {
+            sendBusy = true;
+            const h = hands;
+            // ★ 关键修复：抓到的帧先画到离屏 canvas 再喂 MediaPipe。
+            //   直接喂 ImageBitmap（ImageCapture.grabFrame 返回值）在多数浏览器下
+            //   会静默检测不出手（画面里手清晰却报"未检测到手"）；canvas 输入在
+            //   MediaPipe 上最可靠，真实手也能稳定识别。
+            const fw = frame.width || frame.videoWidth || 640;
+            const fh = frame.height || frame.videoHeight || 480;
+            if (mpCanvas.width !== fw) mpCanvas.width = fw;
+            if (mpCanvas.height !== fh) mpCanvas.height = fh;
+            mpCtx.drawImage(frame, 0, 0, fw, fh);
+            Promise.resolve().then(() => h.send({ image: mpCanvas }))
+              .then(() => { sendBusy = false; }, () => { sendBusy = false; });
+            setTimeout(() => { if (sendBusy) sendBusy = false; }, 1200);
+          }
+        }
+      } catch (e) { /* 忽略单帧异常 */ }
+      if (imgCap) setTimeout(loop, 30);     // ImageCapture 异步抓帧，自行节流
+      else requestAnimationFrame(loop);
+    };
+    loop();
+  }
+
+  camStartBtn.addEventListener('click', async () => {
+    camStartBtn.disabled = true;
+    camStartBtn.textContent = '授权中…';
+    const ok = await beginCamera();
+    if (ok) {
+      cameraReady = true;
+      hideStart();
+      setHint('左下角「手势追踪」可实时看到自己的动作与识别结果 · 1/2/3 比数字 · 五指张开出 I❤U · 握拳出 💗 · 再握拳炸成发光照片球 · ✋ 手掌倾斜/转手腕自由转球（手快球快） · 👌 轻捏调取放大 · 握拳退出', 6200);
+      initMediaPipe();
+    } else {
+      camStartBtn.disabled = false;
+      camStartBtn.textContent = '重试开启摄像头';
+    }
+  });
+
+  demoStartBtn.addEventListener('click', (e) => {
+    e.preventDefault();
+    demoMode = true;
+    camCanvasVisible = false; camWrap.classList.add('hidden');   // 无摄像头时收起追踪窗
+    hideStart();
+    setHint('键盘演示：1/2/3 数字 · 4 告白 → F 握拳进发光照片球 · H 直达 · 空格/P 调取放大照片 · ←→↑↓ 旋转 · R 重置', 6500);
+  });
+
+  // 预置照片（CONFIG.PHOTOS 为空时用占位图）；保存 Promise 供添加队列等待，
+  // 避免页面刚加载就点加号时两次 buildPhotos 并发交错。
+  const initialBuild = buildPhotos(CONFIG.PHOTOS);
+
+  /* ==================================================================
+   * 10. UI：全屏按钮 / 摄像头小窗 / 自定义照片
+   * ================================================================== */
+  const fsBtn = document.getElementById('fsBtn');
+  fsBtn.addEventListener('click', () => {
+    const el = document.getElementById('stage');
+    if (!document.fullscreenElement) {
+      (el.requestFullscreen || el.webkitRequestFullscreen || (() => {})).call(el);
+    } else {
+      (document.exitFullscreen || document.webkitExitFullscreen || (() => {})).call(document);
+    }
+  });
+
+  // 添加照片入口：点击按钮打开文件选择器 → 加入照片球
+  const addBtn = document.getElementById('addBtn');
+  const addStartBtn = document.getElementById('addStart');
+  const fileInput = document.getElementById('fileInput');
+  const openPicker = () => { try { fileInput.click(); } catch (e) { setHint('当前环境无法打开相册，请改用拖拽或 Ctrl+V 粘贴图片', 3500); } };
+  addBtn.addEventListener('click', openPicker);
+  if (addStartBtn) addStartBtn.addEventListener('click', (e) => { e.preventDefault(); openPicker(); });
+  fileInput.addEventListener('change', (e) => {
+    // 必须先拷贝成普通数组再清空：value='' 会同步清空 FileList，
+    // 直接把 e.target.files 传进去会丢掉第 2 张起的所有文件。
+    const picked = Array.from(e.target.files || []);
+    e.target.value = '';   // 允许重复选择同一文件
+    if (picked.length) queueAddPhotos(picked);
+  });
+
+  addEventListener('keydown', (e) => {
+    if (e.key === 'v' || e.key === 'V') {
+      camCanvasVisible = !camCanvasVisible;
+      camWrap.classList.toggle('hidden', !camCanvasVisible);
+      return;
+    }
+    if (!demoMode) return;
+    switch (e.key) {
+      case '1': onGesture('one');       break;
+      case '2': onGesture('two');       break;
+      case '3': onGesture('three');     break;
+      case '4': onGesture('five');      break;   // 五指张开 = 告白 I❤U
+      case 'h': case 'H': triggerPhotoWall(false); break; // 直达照片球（键盘演示快捷键，自动分裂）
+      case 'f': case 'F': onGesture('fist');  break; // 握拳 = I❤U后进入照片球 / 缩回 / 返回 / 重置
+      case 'r': case 'R': resetAll();    break;   // 直接重置待机
+      case ' ': if (state === 'PHOTO') onGesture('pinch'); e.preventDefault(); break; // 调取/缩回照片
+      case 'p': case 'P': if (state === 'PHOTO') onGesture('pinch'); break;         // 👌 捏合同义键
+      case 'ArrowLeft':  if (state === 'PHOTO') injectHandMotion(-0.09, 0, 0); else shapeTargetRotY -= 0.35; e.preventDefault(); break;
+      case 'ArrowRight': if (state === 'PHOTO') injectHandMotion(0.09, 0, 0);  else shapeTargetRotY += 0.35; e.preventDefault(); break;
+      case 'ArrowUp':    if (state === 'PHOTO') injectHandMotion(0, -0.09, 0); e.preventDefault(); break;
+      case 'ArrowDown':  if (state === 'PHOTO') injectHandMotion(0, 0.09, 0);  e.preventDefault(); break;
+    }
+  });
+
+  const extraPhotos = [];   // 用户通过入口/拖拽/粘贴添加的本地图片（持久保留）
+  // ★ 关键修复：先把 FileList 拷成普通数组快照。fileInput 的 change 回调末尾会执行
+  //   value = '' 清空 FileList；若直接遍历它，第一次 await FileReader 让出事件循环后
+  //   length 就变成 0，循环直接结束 → 选了好几张却只加进去第一张。
+  async function addUserPhotos(files) {
+    const list = Array.from(files || []);
+    const urls = await Promise.all(list.map(f => {
+      // type 为空的相册文件也尝试读取（只有明确非图片才跳过），读失败再由 filter 过滤
+      if (f && f.type && !f.type.startsWith('image/')) return Promise.resolve(null);
+      return new Promise(res => {
+        const fr = new FileReader();
+        fr.onload = () => res(fr.result);
+        fr.onerror = () => res(null);
+        fr.readAsDataURL(f);
+      });
+    }));
+    const valid = urls.filter(Boolean);
+    if (!valid.length) { setHint('未选择到图片文件', 2600); return; }
+    extraPhotos.push(...valid);
+    // ★ 用户添加过照片后，球面只保留其添加的照片：不再混入 PHOTO 1~12 占位预览图。
+    //   （buildPhotos 内部仅在 sources 为空时才用 DEFAULT_PHOTOS 兜底，这里必非空。）
+    const all = extraPhotos.slice();
+    const built = await buildPhotos(all);
+    if (!built) return;                    // 被更新的构建取代：不做后续入场
+    // 添加后立刻进入照片球预览，让用户直接看到所有照片（无论当前处于什么状态）
+    hideStart();
+    hidePhotos();
+    balloonGroup.visible = flowerGroup.visible = false;
+    shapeKind = null;
+    burstIntoPhotos();          // 重新随机炸成发光粒子球 + 球面照片
+    setState('PHOTO');
+    setHint(`已添加 ${valid.length} 张照片（共 ${photos.length} 张）`, 3000);
+  }
+  // 串行队列：先等初始构建完成，再依次处理连续点击加号 / 拖拽 / 粘贴，
+  // 避免多次 buildPhotos 交错清空 photos 丢图。
+  let addChain = Promise.resolve(initialBuild).catch(() => {});
+  const queueAddPhotos = (files) => {
+    addChain = addChain.then(() => addUserPhotos(files)).catch(() => {});
+    return addChain;
+  };
+
+  addEventListener('dragover', (e) => { e.preventDefault(); });
+  addEventListener('drop', (e) => {
+    e.preventDefault();
+    if (e.dataTransfer && e.dataTransfer.files.length)
+      queueAddPhotos(Array.from(e.dataTransfer.files));
+  });
+  addEventListener('paste', (e) => {
+    const items = (e.clipboardData && e.clipboardData.items) || [];
+    const files = [];
+    for (const it of items) if (it.type.startsWith('image/')) files.push(it.getAsFile());
+    if (files.length) queueAddPhotos(files);
+  });
+})();
+</script>
+</body>
+</html>
